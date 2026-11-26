@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/tphakala/agy-mcp/v2/internal/policy"
 )
 
 // listAgentsTimeout bounds `agy agents`, and listAgentsKillGrace bounds how long
@@ -39,6 +41,25 @@ const (
 // against agy 1.4.6). Issue
 // #203.
 func (m *Manager) ListAgents(ctx context.Context, cwd string) ([]string, error) {
+	p := m.cfg.Policy
+	if p.DisableAgentSelection {
+		// The empty answer is the contract here: agent selection is off, so
+		// there is nothing to select and nothing to expose. agy is not exec'd,
+		// so no host-side agent catalog leaks through a listing either.
+		return []string{}, nil
+	}
+	if p.Restricted() {
+		// Same rule as a run's cwd: under a restricted policy the listing
+		// process may only ever run inside the allowed roots, and an omitted
+		// cwd must resolve to the configured default, not to the server's own
+		// directory. The canonical path feeds the listing so the project agents
+		// a caller would see for a run in that directory are the ones listed.
+		checked, err := p.CheckDir(cwd)
+		if err != nil {
+			return nil, err
+		}
+		cwd = checked
+	}
 	n, err := normalizeCwd(cwd)
 	if err != nil {
 		return nil, fmt.Errorf("normalize working directory %q: %w", cwd, err)
@@ -47,7 +68,14 @@ func (m *Manager) ListAgents(ctx context.Context, cwd string) ([]string, error) 
 	if err != nil {
 		return nil, err
 	}
-	return decodeAgentsEnvelope(out)
+	agents, err := decodeAgentsEnvelope(out)
+	if err != nil {
+		return nil, err
+	}
+	// The whitelist filters the listing so a caller can never advertise to
+	// itself a name CheckRunOptions would refuse; the order agy listed them in
+	// is preserved.
+	return policy.FilterValues(p.AllowedAgents, agents, func(a string) string { return a }), nil
 }
 
 // agentsCommandName is the command name decodeAgentsEnvelope requires before it

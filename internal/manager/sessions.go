@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -38,6 +39,15 @@ func agyCachePath() string {
 // (see isTransientWorkspace); passing dir returns whatever matches it, transient
 // or not.
 func (m *Manager) ListSessions(dir string) ([]Session, error) {
+	// A non-allow session policy never reads the conversation cache, for both
+	// policies the same way: under disabled the ids must not leave the server,
+	// and under managed-only the cache is not the authorization source either
+	// (the protected session index is; until it exists there is nothing to
+	// list). The error is explicit rather than an empty list, so a caller
+	// cannot read "no sessions" as "continuation is fine".
+	if !m.cfg.Policy.SessionsAllowed() {
+		return nil, fmt.Errorf("list_sessions is disabled by this server's session policy (%s)", m.cfg.Policy.SessionPolicy)
+	}
 	return readSessions(m.cacheFile, dir)
 }
 

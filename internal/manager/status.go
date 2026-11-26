@@ -212,7 +212,31 @@ type Status struct {
 }
 
 // Status derives a job's status from the on-disk store.
+//
+// It is a thin wrapper over status with two policy gates applied to every
+// answer: a protected instance refuses handles it did not create (the refusal
+// reads exactly like a missing job), and a session policy that forbids
+// conversation identifiers strips the id from the answer. The wrapper is the
+// single point both gates live at, so WaitTerminal's poll loop and every tool
+// path that reads a status inherit them without a second implementation to
+// keep honest.
 func (m *Manager) Status(id string) (Status, error) {
+	if err := m.ownershipRefused(id); err != nil {
+		return Status{}, err
+	}
+	st, err := m.status(id)
+	if err != nil {
+		return Status{}, err
+	}
+	if !m.cfg.Policy.SessionsAllowed() {
+		st.ConversationID = ""
+	}
+	return st, nil
+}
+
+// status is Status without the policy gates; RestoreAndCollect's startup scan
+// and other internal readers go through here.
+func (m *Manager) status(id string) (Status, error) {
 	meta, err := m.store.Load(id)
 	if err != nil {
 		return Status{}, err
@@ -1046,6 +1070,12 @@ func readResultPayload(dir string) (streamjson.Result, bool) {
 // code 0, whose out readability and stderr notices both matter) is not
 // fast-pathed but deferred to Status, as is the running/recovery path.
 func (m *Manager) State(id string) (string, error) {
+	// Same ownership gate as Status: state alone already tells a caller
+	// whether a foreign job is still running, which is information the
+	// refusal must not leak.
+	if err := m.ownershipRefused(id); err != nil {
+		return "", err
+	}
 	// Fast path: a terminal sentinel other than a clean exit decides the state
 	// from the code alone. A clean exit (0) is excluded because Status downgrades
 	// a successful-but-unreadable out, or one whose stderr shows agy ended the run

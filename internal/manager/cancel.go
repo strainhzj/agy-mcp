@@ -15,6 +15,12 @@ import (
 // file the supervisor polls for, since Windows has no POSIX signal to deliver to
 // an arbitrary process.
 func (m *Manager) Cancel(id string) error {
+	// Refuse before touching anything: a protected instance never signals a
+	// foreign job's supervisor, not even to cancel it, and the refusal reads
+	// like a missing job (see ownershipRefused).
+	if err := m.ownershipRefused(id); err != nil {
+		return err
+	}
 	meta, err := m.store.Load(id)
 	if err != nil {
 		return fmt.Errorf("load job %s to cancel: %w", id, err)

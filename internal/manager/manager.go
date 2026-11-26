@@ -202,6 +202,11 @@ func (m *Manager) markAgyVerified(agy string) {
 func probeCmd(ctx context.Context, agy string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, agy, args...)
 	proc.ConfigureNoWindow(cmd)
+	// Same environment rule as every other spawn: the control-plane variables
+	// (the bearer token above all) never reach agy, including through the
+	// probes, which run with the caller's cwd as their working directory on
+	// the listing paths and would otherwise hand a workspace hook the token.
+	cmd.Env = config.SanitizeEnv(os.Environ())
 	return cmd
 }
 
@@ -353,6 +358,13 @@ const conversationIDPoll = 50 * time.Millisecond
 // sentinel with no recorded id means none is coming (the run died before agy's
 // init event, or never started at all).
 func (m *Manager) AwaitConversationID(ctx context.Context, job Job) string {
+	// A session policy that forbids conversation identifiers also forbids
+	// reporting one: the id would be a live agy session handle the caller
+	// could hand straight back to conversation_id, which the policy refuses.
+	// The job still runs; only the handle is withheld.
+	if !m.cfg.Policy.SessionsAllowed() {
+		return ""
+	}
 	if job.ConversationID != "" {
 		return job.ConversationID
 	}
@@ -458,7 +470,7 @@ func (m *Manager) conversationLive(convID string) (bool, error) {
 // the normalized cwd plus the request itself (see sameRequest). Any
 // unreadable job makes the lookup fail closed because it could be the binding
 // this retry needs to find.
-func (m *Manager) findIdempotentJob(req StartRequest, args []string) (Job, bool, error) {
+func (m *Manager) findIdempotentJob(req StartRequest, args []string, skipPermissions bool) (Job, bool, error) {
 	if req.IdempotencyKey == "" {
 		return Job{}, false, nil
 	}
@@ -474,8 +486,15 @@ func (m *Manager) findIdempotentJob(req StartRequest, args []string) (Job, bool,
 		if meta.IdempotencyKey != req.IdempotencyKey {
 			continue
 		}
-		if meta.Cwd != req.Cwd || !sameRequest(meta, req, args) {
+		if meta.Cwd != req.Cwd || !sameRequest(meta, req, args, skipPermissions) {
 			return Job{}, false, fmt.Errorf("idempotency_key %q is already bound to job %s with a different normalized request", req.IdempotencyKey, id)
+		}
+		// A protected instance replays only jobs it created itself: a foreign
+		// or unattributed record with the same key is refused exactly like any
+		// other out-of-scope handle, before its state or conversation id is
+		// read (see ownershipRefused).
+		if err := m.ownershipRefused(id); err != nil {
+			return Job{}, false, err
 		}
 		// A persisted record that never recorded a supervisor PID is a
 		// failed-creation remnant, not a job to replay. StartJob records PID>0 (via
@@ -505,27 +524,59 @@ func (m *Manager) findIdempotentJob(req StartRequest, args []string) (Job, bool,
 // requestKey). Keeping a resolved value in a
 // separate local while req stays stale risks a later read of req.Model/req.Timeout
 // silently bypassing the default fallback.
+//
+// The policy checks run inside this function on purpose: the resolved values
+// are exactly what the policy must judge (the canonical cwd, the defaulted
+// model and timeout), and the checks must gate the values before anything
+// downstream (gate key, args, meta, the cache read for continue_latest) is
+// derived from an input the policy was about to refuse. Under a restricted
+// policy the canonical cwd and dirs come from the policy's own resolution, so
+// meta.json, the request key and the --add-dir arguments all carry the same
+// physical paths the check approved.
 func (m *Manager) normalizeRequest(req StartRequest) (StartRequest, error) {
-	cwd := req.Cwd
-	if cwd == "" {
-		wd, err := os.Getwd()
+	p := m.cfg.Policy
+	if err := m.checkSessionPolicy(req); err != nil {
+		return StartRequest{}, err
+	}
+	if err := m.checkSchemaPolicy(&req); err != nil {
+		return StartRequest{}, err
+	}
+	if p.ForceSandbox {
+		req.Sandbox = true
+	}
+	if p.Restricted() {
+		cwd, err := p.CheckDir(req.Cwd)
 		if err != nil {
-			// An empty cwd would run agy in whatever directory this process
-			// inherited, and would be persisted as the job's cwd. Fail instead.
-			// (The cwd itself has no bearing on serialization: conversation locking
-			// uses only a resolved conversation id.)
-			return StartRequest{}, fmt.Errorf("determine working directory: %w", err)
+			return StartRequest{}, err
 		}
-		cwd = wd
+		req.Cwd = cwd
+		dirs, err := p.CheckExtraDirs(req.Cwd, req.Dirs)
+		if err != nil {
+			return StartRequest{}, err
+		}
+		req.Dirs = dirs
+	} else {
+		cwd := req.Cwd
+		if cwd == "" {
+			wd, err := os.Getwd()
+			if err != nil {
+				// An empty cwd would run agy in whatever directory this process
+				// inherited, and would be persisted as the job's cwd. Fail instead.
+				// (The cwd itself has no bearing on serialization: conversation locking
+				// uses only a resolved conversation id.)
+				return StartRequest{}, fmt.Errorf("determine working directory: %w", err)
+			}
+			cwd = wd
+		}
+		// Canonicalize the cwd once so the gate key, cache lookups, cmd.Dir, and
+		// persisted meta all share one spelling (see normalizeCwd). Report the
+		// pre-normalization input on failure (normalizeCwd returns "" on error).
+		normalized, err := normalizeCwd(cwd)
+		if err != nil {
+			return StartRequest{}, fmt.Errorf("normalize working directory %q: %w", cwd, err)
+		}
+		req.Cwd = normalized
 	}
-	// Canonicalize the cwd once so the gate key, cache lookups, cmd.Dir, and
-	// persisted meta all share one spelling (see normalizeCwd). Report the
-	// pre-normalization input on failure (normalizeCwd returns "" on error).
-	normalized, err := normalizeCwd(cwd)
-	if err != nil {
-		return StartRequest{}, fmt.Errorf("normalize working directory %q: %w", cwd, err)
-	}
-	req.Cwd = normalized
 	if req.Model == "" {
 		req.Model = m.cfg.DefaultModel
 	}
@@ -536,9 +587,18 @@ func (m *Manager) normalizeRequest(req StartRequest) (StartRequest, error) {
 	if req.Timeout <= 0 {
 		req.Timeout = m.cfg.DefaultTimeout
 	}
+	// The run options check is deliberately after the defaults resolution:
+	// model here is what would actually run (the caller's value, or the server
+	// default reduced by modelID), timeout is what would actually run, so an
+	// omitted-but-defaulted timeout over the cap is refused here too.
+	if err := p.CheckRunOptions(req.Model, req.Agent, req.Timeout); err != nil {
+		return StartRequest{}, err
+	}
 	// Resolve continue_latest to a concrete conversation id before computing the
 	// gate key and args, so serialization, the agy --conversation flag, and the
-	// returned conversation id are all deterministic and consistent.
+	// returned conversation id are all deterministic and consistent. Sessions
+	// that would violate the policy never reach this read (checkSessionPolicy
+	// refused them above).
 	if req.ContinueLatest {
 		if cid, ok := resolveLatest(m.cacheFile, req.Cwd); ok {
 			req.ConversationID = cid
@@ -559,7 +619,7 @@ func (m *Manager) normalizeRequest(req StartRequest) (StartRequest, error) {
 //     failed-creation cleanup has completed.
 //
 // On any error the claim, if it was taken, is released before returning.
-func (m *Manager) claimIdempotency(req StartRequest, args []string) (existing Job, found bool, release func(), err error) {
+func (m *Manager) claimIdempotency(req StartRequest, args []string, skipPermissions bool) (existing Job, found bool, release func(), err error) {
 	if req.IdempotencyKey == "" {
 		return Job{}, false, func() {}, nil
 	}
@@ -579,7 +639,7 @@ func (m *Manager) claimIdempotency(req StartRequest, args []string) (existing Jo
 	// completed its creation path (or its failed-creation cleanup) and released the
 	// claim, so its current status can be reported accurately, including terminal
 	// replays.
-	job, found, ferr := m.findIdempotentJob(req, args)
+	job, found, ferr := m.findIdempotentJob(req, args, skipPermissions)
 	err = ferr
 	if err != nil {
 		release()
@@ -614,7 +674,12 @@ func (m *Manager) StartJob(req StartRequest) (Job, error) {
 		return Job{}, err
 	}
 
-	args := buildAgyArgs(req)
+	// The skip-permissions decision is a policy property, so it rides through
+	// the args builder explicitly and reaches sameRequest too: a keyless retry
+	// of a pre-request-key job compares literal argv, and a flipped policy
+	// would otherwise match a job built under the other setting.
+	skipPermissions := !m.cfg.Policy.DisableSkipPermissions
+	args := buildAgyArgsWithSkipPermissions(req, skipPermissions)
 
 	// The idempotency claim is a short creation lock, independent of the
 	// conversation gate below. Holding both dimensions separately is what makes
@@ -626,7 +691,7 @@ func (m *Manager) StartJob(req StartRequest) (Job, error) {
 	// releaseIdemOnReturn handoffs below) and releases the claim only after the
 	// failed record is removed, so a retry that lands mid-cleanup is told to retry
 	// ("is starting") rather than handed a job that is being torn down.
-	existing, found, releaseIdem, err := m.claimIdempotency(req, args)
+	existing, found, releaseIdem, err := m.claimIdempotency(req, args, skipPermissions)
 	if err != nil {
 		return Job{}, err
 	}
@@ -725,9 +790,22 @@ func (m *Manager) StartJob(req StartRequest) (Job, error) {
 		m.releaseKey(key)
 		return Job{}, fmt.Errorf("create job store entry: %w", err)
 	}
+	// Stamp the ownership record before anything is spawned into the dir, so
+	// every job a protected instance ever reads has one. On failure the dir is
+	// removed: a protected instance never keeps a job it could not attribute.
+	if err := m.writeOwnership(dir); err != nil {
+		_ = m.store.Remove(id)
+		m.releaseKey(key)
+		return Job{}, fmt.Errorf("record job ownership: %w", err)
+	}
 
 	cmd := exec.Command(m.cfg.SupervisorExe, "run-job", dir)
-	cmd.Env = os.Environ()
+	// SanitizeEnv strips the control-plane variables (the bearer token and the
+	// rest of this server's configuration namespace) from what the supervisor,
+	// and through it agy and everything agy spawns, can see. Workspace hooks
+	// run with this environment (MEASURED against agy 1.5.17), so the token
+	// would otherwise be readable from a hook the job's cwd invited in.
+	cmd.Env = config.SanitizeEnv(os.Environ())
 	// Detach stdio: supervisor must not inherit the manager's stdout (the
 	// JSON-RPC stream in stdio mode).
 	cmd.Stdin = nil
@@ -881,6 +959,18 @@ func (m *Manager) RestoreAndCollect() (removed []string, err error) {
 	}
 	for _, id := range ids {
 		l := m.loadJob(id)
+		// A protected instance refuses to start over a store that holds jobs it
+		// did not create: the state dir is instance-dedicated by contract, so a
+		// foreign or unattributed record means the directory is shared or was
+		// pointed at a reused one, and importing those jobs would hand this
+		// instance's callers another instance's results (or let a replay bind
+		// to them). Startup refuses and the operator points the instance at its
+		// own dir; nothing is removed or adopted here.
+		if m.cfg.Policy.Protected() {
+			if err := m.ownershipRefused(l.id); err != nil {
+				return nil, fmt.Errorf("startup recovery: state dir %s holds job %s without a matching ownership record for this instance: %w", m.cfg.StateDir, l.id, err)
+			}
+		}
 		if gcEnabled && m.gcEvaluate(l, cutoff) {
 			removed = append(removed, id)
 			continue // removed; nothing to restore (a removed job was terminal or dead)
@@ -1188,8 +1278,24 @@ func workspaceDirs(req StartRequest) []string {
 }
 
 func buildAgyArgs(req StartRequest) []string {
-	args := []string{
-		dangerouslySkipPermissionsFlag,
+	// The default stays skip-permissions-on: buildAgyArgs is the upstream
+	// shape (tests, doctor and sameRequest's legacy branch rely on it), and
+	// StartJob passes the policy-derived value explicitly.
+	return buildAgyArgsWithSkipPermissions(req, true)
+}
+
+// buildAgyArgsWithSkipPermissions builds the agy argv, including
+// --dangerously-skip-permissions only when skipPermissions is set. The flag
+// stays first when present so the argv is byte-identical to what earlier
+// releases built: sameRequest's keyless branch compares argv slices against
+// persisted meta, so reordering the flags would refuse every keyless retry of
+// an old job until GC reaps it.
+func buildAgyArgsWithSkipPermissions(req StartRequest, skipPermissions bool) []string {
+	var args []string
+	if skipPermissions {
+		args = append(args, dangerouslySkipPermissionsFlag)
+	}
+	args = append(args,
 		printTimeoutFlag, req.Timeout.String(),
 		outputFormatFlag, streamJSONFormat,
 		// Keep caller prompts literal. Per agy's changelog, 1.1.9 added slash-command
@@ -1207,7 +1313,7 @@ func buildAgyArgs(req StartRequest) []string {
 		// at the tool boundary rather than this
 		// flag being dropped for it; see the mode constants in internal/mcptools.
 		disableSlashCommandsFlag,
-	}
+	)
 	if req.Model != "" {
 		args = append(args, modelFlag, req.Model)
 	}

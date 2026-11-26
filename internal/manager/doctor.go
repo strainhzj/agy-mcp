@@ -2,14 +2,19 @@ package manager
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tphakala/agy-mcp/v2/internal/agyver"
 	"github.com/tphakala/agy-mcp/v2/internal/config"
+	"github.com/tphakala/agy-mcp/v2/internal/jobstore"
+	"github.com/tphakala/agy-mcp/v2/internal/policy"
 )
 
 // Check names, shared by each check and its tests (see doctor_test.go, which
@@ -22,6 +27,7 @@ const (
 	checkAgyReachableName = "agy reachable (auth)"
 	checkStateDirName     = "state dir"
 	checkConfigName       = "config"
+	checkPolicyName       = "policy"
 	checkJobsName         = "jobs"
 	checkADCEnvName       = "ADC sign-in env"
 )
@@ -114,6 +120,7 @@ func (m *Manager) Doctor(ctx context.Context) DoctorReport {
 		checkADCEnv(os.Getenv, agyV, agyVOK),
 		m.checkStateDir(),
 		m.checkConfigSources(),
+		m.checkPolicy(),
 		m.checkStaleJobs(),
 	}}
 }
@@ -208,6 +215,15 @@ func (m *Manager) checkAgyReachable(ctx context.Context) CheckResult {
 	models, err := m.ListModels(ctx)
 	if err != nil {
 		return CheckResult{checkAgyReachableName, CheckFail, err.Error()}
+	}
+	// ListModels already applied the whitelist, so an empty listing under a
+	// configured whitelist means agy's catalog and the whitelist do not
+	// intersect: every run naming a model would be refused, and so would every
+	// run omitting one (CheckRunOptions refuses an empty model against a
+	// whitelist). That is a warning, not a failure: agy itself is reachable,
+	// and the operator may be mid-rename.
+	if len(models) == 0 && len(m.cfg.Policy.AllowedModels) > 0 {
+		return CheckResult{checkAgyReachableName, CheckWarn, fmt.Sprintf("model listing reachable, but the %s whitelist matched none of agy's models; every run would be refused until the whitelist names a model agy lists", config.EnvAllowedModels)}
 	}
 	return CheckResult{checkAgyReachableName, CheckPass, fmt.Sprintf("model listing reachable (%d model(s))", len(models))}
 }
@@ -324,7 +340,70 @@ func (m *Manager) checkConfigSources() CheckResult {
 	} else {
 		line("http token", "unset (HTTP mode unauthenticated)", "")
 	}
+	// Policy-facing settings with their source. Values here are not secrets
+	// (paths, durations, counts, profile names); the token above stays the one
+	// set/unset line.
+	line("profile", config.EnvProfile, orUnset(m.cfg.Policy.Profile))
+	if v := os.Getenv(config.EnvMaxConcurrency); v != "" {
+		line("concurrency", config.EnvMaxConcurrency, strconv.Itoa(m.cfg.MaxConcurrency))
+	} else {
+		line("concurrency", "default", strconv.Itoa(m.cfg.MaxConcurrency))
+	}
+	if v := os.Getenv(config.EnvMaxTimeout); v != "" {
+		line("max timeout", config.EnvMaxTimeout, m.cfg.Policy.MaxTimeout.String())
+	} else {
+		line("max timeout", "upstream ceiling (24h)", "")
+	}
+	// The resolved default a request without a timeout gets, whatever produced
+	// it (upstream default or the policy downshift); the doctor acceptance
+	// names this value explicitly.
+	line("default timeout", "resolved", fmt.Sprintf("%s (%s)", m.cfg.DefaultTimeout, m.waitCapSource()))
+	line("sync wait cap", config.EnvSyncWaitCap, syncWaitCapSource())
+	line("session policy", config.EnvSessionPolicy, string(m.cfg.Policy.SessionPolicy))
+	if len(m.cfg.Policy.AllowedRoots) > 0 {
+		line("allowed roots", config.EnvAllowedRoots, strings.Join(m.cfg.Policy.AllowedRoots, string(filepath.ListSeparator)))
+	} else {
+		line("allowed roots", "unset (no path checks)", "")
+	}
+	if m.cfg.Policy.DefaultCwd != "" {
+		line("default cwd", config.EnvDefaultCwd, m.cfg.Policy.DefaultCwd)
+	}
+	if m.cfg.InstanceID != "" || m.cfg.ProjectID != "" {
+		line("identity", config.EnvProjectID+"/"+config.EnvInstanceID, m.cfg.ProjectID+"/"+m.cfg.InstanceID)
+	}
 	return CheckResult{checkConfigName, CheckPass, strings.TrimPrefix(b.String(), "\n")}
+}
+
+// orUnset renders an optional string setting's value or a marker for unset.
+func orUnset(v string) string {
+	if v == "" {
+		return "unset (upstream behavior)"
+	}
+	return v
+}
+
+// syncWaitCapSource names how the inline-wait ceiling resolved: the variable,
+// or the built-in default when the variable is unset or unparseable. The
+// value itself is not secret, so it is shown.
+func syncWaitCapSource() string {
+	if v := os.Getenv(config.EnvSyncWaitCap); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return config.EnvSyncWaitCap + "=" + v
+		}
+		return "unset (unparseable value ignored), default " + config.DefaultSyncWaitCap.String()
+	}
+	return "unset, default " + config.DefaultSyncWaitCap.String()
+}
+
+// waitCapSource names what produced the effective default timeout: the policy
+// downshift when MaxTimeout is set below the upstream default, or the upstream
+// default. It is a one-line explanation, not a re-derivation: the resolved
+// value is printed alongside it.
+func (m *Manager) waitCapSource() string {
+	if mt := m.cfg.Policy.MaxTimeout; mt > 0 && mt < 30*time.Minute {
+		return "lowered to MaxTimeout"
+	}
+	return "upstream default"
 }
 
 // checkStaleJobs reports jobs the store still holds whose supervisor process is
@@ -378,4 +457,111 @@ func (m *Manager) checkStaleJobs() CheckResult {
 	}
 	slices.Sort(stale)
 	return CheckResult{checkJobsName, CheckWarn, fmt.Sprintf("%d stale job(s) from a prior crash (GC reaps them): %s", len(stale), strings.Join(stale, ", "))}
+}
+
+// checkPolicy reports the deployment policy's own health, distinct from the
+// config check (which names where each setting came from) and from any OS
+// isolation the deployment provides (which no check here can see).
+//
+// Unconfigured, it passes with "unrestricted (default)", so an upstream
+// install gets the same doctor output and exit code as before this check
+// existed. Configured, it re-validates what ValidateAndNormalize checked at
+// startup (a root directory can be deleted or replaced after boot) and, for a
+// protected profile, re-checks the profile's fixed requirements and scans the
+// state dir for jobs this instance does not own: the same refusal startup
+// applies, reported here so `doctor` explains a start that is about to fail.
+//
+// Every restricted verdict carries the standing reminder that parameter
+// checks are not a filesystem boundary: agy's built-in tools, its workspace
+// hooks, and even --sandbox (MEASURED against agy 1.5.17) can reach outside
+// cwd, so isolation comes from the deployment's OS layer, never from this
+// check passing.
+func (m *Manager) checkPolicy() CheckResult {
+	p := m.cfg.Policy
+	if !p.Restricted() && p.Profile == "" && !p.RequireHTTPToken && p.SessionsAllowed() &&
+		!p.ForceSandbox && !p.DisableSkipPermissions && !p.DisableContinueLatest &&
+		p.MaxTimeout == 0 && len(p.AllowedModels) == 0 && len(p.AllowedAgents) == 0 {
+		return CheckResult{checkPolicyName, CheckPass, "unrestricted (default)"}
+	}
+	// Re-validate a copy: ValidateAndNormalize rewrites path fields to
+	// canonical form, and doctor must not mutate the live config. A failure
+	// here mirrors what startup already refused (or will refuse on the next
+	// boot), which is exactly what an operator debugging a refusal needs.
+	recheck := p
+	var b strings.Builder
+	if err := recheck.ValidateAndNormalize(); err != nil {
+		return CheckResult{checkPolicyName, CheckFail, err.Error()}
+	}
+	say := func(format string, args ...any) {
+		fmt.Fprintf(&b, "\n    "+format, args...)
+	}
+	verdict := CheckPass
+	if recheck.Restricted() {
+		say("path checks on: %d allowed root(s), cwd and dirs must resolve inside them", len(recheck.AllowedRoots))
+		for _, root := range recheck.AllowedRoots {
+			say("root %s", root)
+		}
+	}
+	if recheck.DefaultCwd != "" {
+		say("default cwd %s", recheck.DefaultCwd)
+	}
+	say("session policy %s", recheck.SessionPolicy)
+	if recheck.DisableContinueLatest {
+		say("continue_latest disabled")
+	}
+	if recheck.Protected() {
+		say("profile %s: json_schema refused, HTTP bearer token required, stdio refused", policy.ProfilePi)
+		if m.cfg.InstanceID == "" || m.cfg.ProjectID == "" {
+			verdict = CheckFail
+			say("FAIL: the profile requires %s and %s; identity is empty", config.EnvProjectID, config.EnvInstanceID)
+		}
+		// The state dir must be attributable to this instance: any job whose
+		// ownership record is missing or names another project or instance
+		// means the directory is shared or reused, the same condition startup
+		// (RestoreAndCollect) refuses on. Ids are named: doctor is the
+		// operator's tool on the host, not a caller-facing surface.
+		ids, err := m.store.List()
+		if err != nil {
+			verdict = CheckFail
+			say("FAIL: cannot list the state dir to check job ownership: %v", err)
+		} else {
+			var foreign []string
+			for _, id := range ids {
+				dir, derr := m.store.Dir(id)
+				if derr != nil {
+					foreign = append(foreign, id)
+					continue
+				}
+				rec, rerr := readOwnershipRecord(dir)
+				if rerr != nil || rec.InstanceID != m.cfg.InstanceID || rec.ProjectID != m.cfg.ProjectID {
+					foreign = append(foreign, id)
+				}
+			}
+			if len(foreign) > 0 {
+				verdict = CheckFail
+				say("FAIL: %d job(s) in the state dir lack a matching ownership record (%s); the dir is shared or was reused, and startup will refuse it", len(foreign), strings.Join(foreign, ", "))
+			}
+		}
+	}
+	// The standing reminder, on every restricted verdict. It is the one claim
+	// in this report the code cannot verify, so it is stated as what it is: a
+	// boundary this check does not provide.
+	say("note: parameter checks and --sandbox are not a filesystem boundary; agy's built-in tools and workspace hooks reach outside cwd (MEASURED against agy 1.5.17), so isolation is the deployment's OS layer, verified there, not here")
+	return CheckResult{checkPolicyName, verdict, strings.TrimPrefix(b.String(), "\n")}
+}
+
+// readOwnershipRecord reads one job dir's ownership record for doctor's scan.
+// It is doctor-side (diagnostic, operator-facing) and deliberately separate
+// from ownershipRefused, whose contract is to say nothing about WHY a job was
+// refused.
+func readOwnershipRecord(dir string) (jobOwnership, error) {
+	b, err := os.ReadFile(jobstore.OwnershipPath(dir))
+	if err != nil {
+		return jobOwnership{}, err
+	}
+	var rec jobOwnership
+	if err := json.Unmarshal(b, &rec); err != nil {
+		return jobOwnership{}, err
+	}
+	return rec, nil
 }

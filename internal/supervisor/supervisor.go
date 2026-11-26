@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tphakala/agy-mcp/v2/internal/config"
 	"github.com/tphakala/agy-mcp/v2/internal/jobstore"
 	"github.com/tphakala/agy-mcp/v2/internal/proc"
 )
@@ -274,7 +275,12 @@ func run(jobDir string, grace, drainWait time.Duration) error {
 	args := ensureStreamJSON(m.Args)
 	cmd := exec.Command(m.AgyPath, args...)
 	cmd.Dir = m.Cwd
-	cmd.Env = os.Environ() // agy needs HOME/PATH and its OAuth/API credentials
+	// SanitizeEnv strips the agy-mcp control-plane variables (the bearer token
+	// above all) before agy, its tools, its hooks and its MCP plugins see the
+	// environment. The manager already sanitized what it handed this process;
+	// filtering again keeps the invariant local to the spawner instead of
+	// trusting every future caller to remember it.
+	cmd.Env = config.SanitizeEnv(os.Environ()) // agy needs HOME/PATH and its OAuth/API credentials
 	cmd.Stdin = devnull
 	cmd.Stderr = errF
 	// agy runs with --output-format stream-json, so stdout is an event stream to

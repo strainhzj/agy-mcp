@@ -96,7 +96,12 @@ func requestKey(req StartRequest) string {
 // --conversation. Refusing is the fail-safe direction: keyless meta does not
 // record whether the job came from continue_latest or an explicit
 // conversation_id, and such jobs (v2.8.1 or earlier) live at most JobTTL.
-func sameRequest(meta jobstore.Meta, req StartRequest, args []string) bool {
+//
+// skipPermissions must be the value StartJob passed the args builder for the
+// incoming request: the legacy branch rebuilds the argv the same way the
+// original spawn did, so a keyless retry is compared under the same
+// skip-permissions policy, never against a mixed shape.
+func sameRequest(meta jobstore.Meta, req StartRequest, args []string, skipPermissions bool) bool {
 	if meta.RequestKey != "" {
 		return meta.RequestKey == requestKey(req)
 	}
@@ -105,5 +110,5 @@ func sameRequest(meta jobstore.Meta, req StartRequest, args []string) bool {
 	}
 	before := req
 	before.SkipProjectRules = true
-	return slices.Equal(meta.Args, buildAgyArgs(before))
+	return slices.Equal(meta.Args, buildAgyArgsWithSkipPermissions(before, skipPermissions))
 }

@@ -75,18 +75,40 @@ const (
 	// cancelled, so a job that finishes on its own after the request still wakes
 	// (issue #194). Existence is the whole signal.
 	DismissedFile = "dismissed"
+	// OwnershipFile is the protected-instance job-ownership record the manager
+	// writes when it creates a job under a protected profile (see
+	// internal/policy). It holds the deployment-assigned project and instance
+	// identity, and a protected instance refuses every Status, Wait, State,
+	// Cancel and idempotent replay for a job whose record is missing or names
+	// another instance, so a shared state directory can never leak one
+	// instance's jobs or results to another. It is written by the manager only;
+	// the supervisor and agy never read or write it. Its absence is normal for
+	// jobs created under a non-protected configuration, which is exactly why
+	// only protected instances may consult it.
+	OwnershipFile = "ownership.json"
 )
 
 // MetaPath, OutPath, ErrPath, ExitCodePath, ProgressPath and ResultPath join a
 // job directory with the corresponding file name. They are the shared spelling
 // for callers that hold only the directory (the supervisor, the manager's
 // status reader) rather than a store id.
-func MetaPath(dir string) string     { return filepath.Join(dir, MetaFile) }
-func OutPath(dir string) string      { return filepath.Join(dir, OutFile) }
-func ErrPath(dir string) string      { return filepath.Join(dir, ErrFile) }
-func ExitCodePath(dir string) string { return filepath.Join(dir, ExitCodeFile) }
-func ProgressPath(dir string) string { return filepath.Join(dir, ProgressFile) }
-func ResultPath(dir string) string   { return filepath.Join(dir, ResultFile) }
+func MetaPath(dir string) string      { return filepath.Join(dir, MetaFile) }
+func OutPath(dir string) string       { return filepath.Join(dir, OutFile) }
+func ErrPath(dir string) string       { return filepath.Join(dir, ErrFile) }
+func ExitCodePath(dir string) string  { return filepath.Join(dir, ExitCodeFile) }
+func ProgressPath(dir string) string  { return filepath.Join(dir, ProgressFile) }
+func ResultPath(dir string) string    { return filepath.Join(dir, ResultFile) }
+func OwnershipPath(dir string) string { return filepath.Join(dir, OwnershipFile) }
+
+// WriteOwnershipFile atomically writes the protected job-ownership record b
+// to dir. It is exported because the writer is the manager (which knows the
+// deployment identity) while the file name belongs to this package's job-dir
+// contract; the temp-plus-rename gives the same torn-write protection the
+// meta and result files get. The caller serializes: it runs during StartJob
+// on a freshly created dir no other process touches yet.
+func WriteOwnershipFile(dir string, b []byte) error {
+	return writeFileAtomicDurable(dir, OwnershipFile, b)
+}
 
 // Progress is the supervisor's running summary of a job's stream position. It
 // exists so the conversation id agy reports in its init event is readable by

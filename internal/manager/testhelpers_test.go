@@ -8,6 +8,7 @@ import (
 	"github.com/tphakala/agy-mcp/v2/internal/agyver"
 	"github.com/tphakala/agy-mcp/v2/internal/config"
 	"github.com/tphakala/agy-mcp/v2/internal/jobstore"
+	"github.com/tphakala/agy-mcp/v2/internal/policy"
 	"github.com/tphakala/agy-mcp/v2/internal/testutil"
 )
 
@@ -37,6 +38,9 @@ type managerOpts struct {
 	defaultModel   string
 	jobTTL         time.Duration
 	withCacheFile  bool // true -> m.cacheFile = a fresh t.TempDir()/last_conversations.json
+	pol            policy.Policy
+	projectID      string
+	instanceID     string
 }
 
 // newManager builds a *Manager for tests, consolidating the suite's several
@@ -60,6 +64,9 @@ func newManager(t *testing.T, opts managerOpts) *Manager {
 		DefaultModel:   opts.defaultModel,
 		MaxConcurrency: maxConcurrency,
 		JobTTL:         opts.jobTTL,
+		Policy:         opts.pol,
+		ProjectID:      opts.projectID,
+		InstanceID:     opts.instanceID,
 	})
 	if opts.withCacheFile {
 		m.cacheFile = filepath.Join(t.TempDir(), "last_conversations.json")

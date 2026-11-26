@@ -11,6 +11,11 @@ package manager
 // The write is best effort for the caller: a failure leaves the marker absent,
 // which only means a redundant wake.
 func (m *Manager) MarkCollected(id string) error {
+	// A mutating marker must not be written for a foreign job: it changes the
+	// wake behavior a supervisor of another instance may still be serving.
+	if err := m.ownershipRefused(id); err != nil {
+		return err
+	}
 	return m.store.MarkCollected(id)
 }
 
@@ -24,6 +29,9 @@ func (m *Manager) Collected(id string) bool {
 // when the job ends cancelled. The write is best effort for the caller: a
 // failure leaves the marker absent, which only means a redundant wake.
 func (m *Manager) MarkDismissed(id string) error {
+	if err := m.ownershipRefused(id); err != nil {
+		return err
+	}
 	return m.store.MarkDismissed(id)
 }
 

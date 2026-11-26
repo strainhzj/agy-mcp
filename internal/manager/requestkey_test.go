@@ -141,7 +141,9 @@ func TestFindIdempotentJobAcrossBuilds(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			job, found, err := m.findIdempotentJob(req, args)
+			// true is the skip-permissions policy buildAgyArgs used above; the
+			// keyless comparisons must run under the same policy the args were built with.
+			job, found, err := m.findIdempotentJob(req, args, true)
 			if tc.wantFound {
 				if err != nil || !found || job.ID != "j" {
 					t.Fatalf("findIdempotentJob = %+v, %v, %v; want the existing job", job, found, err)

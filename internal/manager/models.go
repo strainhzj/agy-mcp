@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tphakala/agy-mcp/v2/internal/policy"
 	"github.com/tphakala/agy-mcp/v2/internal/proc"
 )
 
@@ -256,7 +257,14 @@ func (m *Manager) ListModels(ctx context.Context) ([]Model, error) {
 	if err != nil {
 		return nil, err
 	}
-	return decodeModelsEnvelope(out)
+	models, err := decodeModelsEnvelope(out)
+	if err != nil {
+		return nil, err
+	}
+	// A configured whitelist filters the listing, so a caller cannot talk
+	// itself into passing a model CheckRunOptions would refuse at StartJob.
+	// The full catalog stays visible to the doctor, which filters nothing.
+	return policy.FilterValues(m.cfg.Policy.AllowedModels, models, func(mo Model) string { return mo.ID }), nil
 }
 
 const (

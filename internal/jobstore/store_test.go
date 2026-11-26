@@ -2,6 +2,7 @@ package jobstore
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -419,5 +420,32 @@ func TestMkdirAllDurableCreatesMissingTree(t *testing.T) {
 	// of the exported contract; the fsync-skip itself is not test-observable).
 	if err := MkdirAllDurable(target, 0o700); err != nil {
 		t.Fatalf("MkdirAllDurable(existing): %v", err)
+	}
+}
+
+// TestInstanceRecordRoundTrip pins the deployment record the launcher writes
+// and config.Resolve reads: a written record reads back field for field, and
+// a state directory without one reads as an error (not a zero record), which
+// is the fail-closed half the protected startup relies on.
+func TestInstanceRecordRoundTrip(t *testing.T) {
+	state := t.TempDir()
+	rec := InstanceRecord{
+		Contract:            InstanceContract,
+		ProjectID:           "proj-1",
+		InstanceID:          "inst-1",
+		SnapshotFingerprint: "fp-1",
+	}
+	if err := WriteInstanceRecord(state, rec); err != nil {
+		t.Fatalf("write instance record: %v", err)
+	}
+	got, err := ReadInstanceRecord(state)
+	if err != nil {
+		t.Fatalf("read instance record: %v", err)
+	}
+	if got != rec {
+		t.Fatalf("record = %+v, want %+v", got, rec)
+	}
+	if _, err := ReadInstanceRecord(t.TempDir()); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("missing record err = %v, want fs.ErrNotExist", err)
 	}
 }

@@ -78,27 +78,42 @@ const (
 	// OwnershipFile is the protected-instance job-ownership record the manager
 	// writes when it creates a job under a protected profile (see
 	// internal/policy). It holds the deployment-assigned project and instance
-	// identity, and a protected instance refuses every Status, Wait, State,
-	// Cancel and idempotent replay for a job whose record is missing or names
-	// another instance, so a shared state directory can never leak one
-	// instance's jobs or results to another. It is written by the manager only;
-	// the supervisor and agy never read or write it. Its absence is normal for
-	// jobs created under a non-protected configuration, which is exactly why
-	// only protected instances may consult it.
+	// identity plus the snapshot fingerprint the deployment serves, and a
+	// protected instance refuses every Status, Wait, State, Cancel and
+	// idempotent replay for a job whose record is missing, names another
+	// instance, or names another snapshot version. That binding is what makes
+	// a redeployed snapshot a re-verification event instead of a silent
+	// continuation of old answers (the hardening plan, section 4.7). It is
+	// written by the manager only; the supervisor and agy never read or write
+	// it. Its absence is normal for jobs created under a non-protected
+	// configuration, which is exactly why only protected instances may consult
+	// it.
 	OwnershipFile = "ownership.json"
+	// InstanceRecordFile is the deployment record the controlled launcher
+	// writes into an instance's state directory before the server starts (see
+	// deploy/launch-pi.sh). It names the deployment contract version, the
+	// project and instance identity, and the fingerprint of the project
+	// snapshot the deployment serves. A protected server refuses to start over
+	// a state directory without a matching record, so a bare start of the pi
+	// profile fails closed, two instances cannot quietly share one state
+	// directory, and a snapshot change cannot reuse an old deployment's
+	// identity. Like OwnershipFile it is written by the control plane only;
+	// the supervisor and agy never read or write it.
+	InstanceRecordFile = "instance.json"
 )
 
 // MetaPath, OutPath, ErrPath, ExitCodePath, ProgressPath and ResultPath join a
 // job directory with the corresponding file name. They are the shared spelling
 // for callers that hold only the directory (the supervisor, the manager's
 // status reader) rather than a store id.
-func MetaPath(dir string) string      { return filepath.Join(dir, MetaFile) }
-func OutPath(dir string) string       { return filepath.Join(dir, OutFile) }
-func ErrPath(dir string) string       { return filepath.Join(dir, ErrFile) }
-func ExitCodePath(dir string) string  { return filepath.Join(dir, ExitCodeFile) }
-func ProgressPath(dir string) string  { return filepath.Join(dir, ProgressFile) }
-func ResultPath(dir string) string    { return filepath.Join(dir, ResultFile) }
-func OwnershipPath(dir string) string { return filepath.Join(dir, OwnershipFile) }
+func MetaPath(dir string) string                { return filepath.Join(dir, MetaFile) }
+func OutPath(dir string) string                 { return filepath.Join(dir, OutFile) }
+func ErrPath(dir string) string                 { return filepath.Join(dir, ErrFile) }
+func ExitCodePath(dir string) string            { return filepath.Join(dir, ExitCodeFile) }
+func ProgressPath(dir string) string            { return filepath.Join(dir, ProgressFile) }
+func ResultPath(dir string) string              { return filepath.Join(dir, ResultFile) }
+func OwnershipPath(dir string) string           { return filepath.Join(dir, OwnershipFile) }
+func InstanceRecordPath(stateDir string) string { return filepath.Join(stateDir, InstanceRecordFile) }
 
 // WriteOwnershipFile atomically writes the protected job-ownership record b
 // to dir. It is exported because the writer is the manager (which knows the
@@ -108,6 +123,56 @@ func OwnershipPath(dir string) string { return filepath.Join(dir, OwnershipFile)
 // on a freshly created dir no other process touches yet.
 func WriteOwnershipFile(dir string, b []byte) error {
 	return writeFileAtomicDurable(dir, OwnershipFile, b)
+}
+
+// InstanceContract is the deployment-record contract version this build
+// understands. Raising it is deliberate: a server must refuse a record written
+// by a newer launcher contract rather than guess at fields it cannot see, the
+// same way a lower agyver.Required is refused.
+const InstanceContract = 1
+
+// InstanceRecord is the deployment record described at InstanceRecordFile.
+// The launcher writes it; config.Resolve reads and verifies it under the pi
+// profile; the manager stamps the fingerprint into every job's ownership
+// record.
+type InstanceRecord struct {
+	// Contract guards the record's shape: a server refuses a contract it does
+	// not know instead of guessing at fields it cannot see.
+	Contract   int    `json:"contract"`
+	ProjectID  string `json:"project_id"`
+	InstanceID string `json:"instance_id"`
+	// SnapshotFingerprint is the launcher-computed fingerprint of the project
+	// snapshot this deployment serves. It binds job ownership and idempotent
+	// replay to one snapshot version: new content over the same paths must be
+	// a redeployment, never a silent continuation of old answers.
+	SnapshotFingerprint string `json:"snapshot_fingerprint"`
+}
+
+// WriteInstanceRecord atomically and durably writes the deployment record to
+// the state directory root. Exported for the launcher-side tests; the
+// production writer is launch-pi.sh.
+func WriteInstanceRecord(stateDir string, r InstanceRecord) error {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomicDurable(stateDir, InstanceRecordFile, b)
+}
+
+// ReadInstanceRecord reads the deployment record from a state directory.
+// Every failure is surfaced (not folded into a zero value): a protected
+// instance treats an absent, unreadable or malformed record as a refused
+// start, not as an empty default.
+func ReadInstanceRecord(stateDir string) (InstanceRecord, error) {
+	b, err := os.ReadFile(InstanceRecordPath(stateDir))
+	if err != nil {
+		return InstanceRecord{}, err
+	}
+	var r InstanceRecord
+	if err := json.Unmarshal(b, &r); err != nil {
+		return InstanceRecord{}, err
+	}
+	return r, nil
 }
 
 // Progress is the supervisor's running summary of a job's stream position. It

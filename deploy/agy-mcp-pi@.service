@@ -1,0 +1,46 @@
+# systemd template unit: one protected agy-mcp instance per project.
+# Install as /etc/systemd/system/agy-mcp-pi@.service, then:
+#   systemctl enable --now agy-mcp-pi@pi-review
+# The instance name selects the manifest: /etc/agy-mcp/pi/%i.env
+#
+# The unit hosts the launcher (which execs bubblewrap), so every process of
+# the instance - server, supervisor, worker, hooks - lives in this unit's
+# cgroup, and KillMode=control-group reclaims the whole tree on stop, not
+# just the foreground process.
+
+[Unit]
+Description=agy-mcp protected pi instance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# The manifest is root-owned, 0600: it names paths, not secrets, but keeping
+# it private is the cheaper habit. The launcher itself sources nothing from
+# the workspace.
+EnvironmentFile=/etc/agy-mcp/pi/%i.env
+ExecStart=/usr/local/bin/launch-pi.sh
+Restart=on-failure
+RestartSec=5s
+
+# OS-level backstops behind the bubblewrap boundaries. The namespaces inside
+# do the real isolation; these limit what the unit's processes can do to the
+# host if bubblewrap itself were bypassed.
+NoNewPrivileges=true
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+LimitNPROC=256
+MemoryMax=1G
+TasksMax=128
+
+# Hardening that does not fight the sandbox: the launcher and bubblewrap need
+# to create mount and user namespaces, so PrivateDevices/PrivateTmp etc. are
+# deliberately not used here; the sandboxes provide stricter versions of the
+# same limits with mount sets the launcher controls.
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/agy-mcp
+
+[Install]
+WantedBy=multi-user.target

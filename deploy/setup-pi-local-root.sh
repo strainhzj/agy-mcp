@@ -70,7 +70,7 @@ nft -f - <<EOF
 table inet agy_pi_review {
 	chain egress {
 		type filter hook output priority filter; policy accept;
-		socket cgroupv2 1 "$CG_NAME" tcp dport != $PROXY_PORT counter drop
+		socket cgroupv2 level 1 "$CG_NAME" tcp dport != $PROXY_PORT counter drop
 	}
 }
 EOF

@@ -4,12 +4,29 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/tphakala/agy-mcp/v2/internal/jobstore"
 	"github.com/tphakala/agy-mcp/v2/internal/policy"
 )
+
+// writeRecord writes the deployment record the controlled launcher would
+// write, so a pi-profile resolve sees the state-dir contract it requires
+// (project, instance and a snapshot fingerprint).
+func writeRecord(t *testing.T, stateDir, project, instance string) {
+	t.Helper()
+	if err := jobstore.WriteInstanceRecord(stateDir, jobstore.InstanceRecord{
+		Contract:            jobstore.InstanceContract,
+		ProjectID:           project,
+		InstanceID:          instance,
+		SnapshotFingerprint: "fp-" + instance,
+	}); err != nil {
+		t.Fatalf("write instance record: %v", err)
+	}
+}
 
 // dir returns an existing canonical temporary directory (roots and cwd values
 // are validated by EvalSymlinks, and on macOS the TempDir path itself is a
@@ -176,7 +193,7 @@ func TestResolvePolicyErrors(t *testing.T) {
 		{"bad session policy", map[string]string{EnvSessionPolicy: "sometimes"}, "unknown session policy"},
 		{"empty session policy", map[string]string{EnvSessionPolicy: ""}, "set but empty"},
 		{"bad max timeout", map[string]string{EnvMaxTimeout: "soon"}, "invalid duration"},
-		{"negative max timeout", map[string]string{EnvMaxTimeout: "-5m"}, "negative"},
+		{"negative max timeout", map[string]string{EnvMaxTimeout: "-5m"}, "positive duration"},
 		{"over-ceiling max timeout", map[string]string{EnvMaxTimeout: "25h"}, "exceeds"},
 		{"bad concurrency", map[string]string{EnvMaxConcurrency: "0"}, "positive integer"},
 		{"non-numeric concurrency", map[string]string{EnvMaxConcurrency: "lots"}, "positive integer"},
@@ -197,6 +214,7 @@ func TestResolvePolicyErrors(t *testing.T) {
 func TestResolvePiProfile(t *testing.T) {
 	root := dir(t)
 	state := dir(t)
+	writeRecord(t, state, "proj-1", "inst-1")
 	c, err := resolveFor(t, map[string]string{
 		EnvProfile:        policy.ProfilePi,
 		EnvAllowedRoots:   root,
@@ -229,6 +247,9 @@ func TestResolvePiProfile(t *testing.T) {
 	if c.StateDir != state {
 		t.Fatalf("state dir %q, want %q", c.StateDir, state)
 	}
+	if c.SnapshotFingerprint != "fp-inst-1" {
+		t.Fatalf("snapshot fingerprint %q, want the record's", c.SnapshotFingerprint)
+	}
 	if c.DefaultTimeout != 20*time.Minute || c.MaxConcurrency != 2 {
 		t.Fatalf("timeout/concurrency %s/%d", c.DefaultTimeout, c.MaxConcurrency)
 	}
@@ -238,11 +259,13 @@ func TestResolvePiProfileExplicitManagedOnlyAccepted(t *testing.T) {
 	// managed-only is a Phase 3 value the profile accepts explicitly (it is
 	// what a Phase 3 rollout sets); allow stays refused.
 	root := dir(t)
+	state := dir(t)
+	writeRecord(t, state, "p", "i")
 	c, err := resolveFor(t, map[string]string{
 		EnvProfile:       policy.ProfilePi,
 		EnvAllowedRoots:  root,
 		EnvDefaultCwd:    root,
-		EnvStateDir:      dir(t),
+		EnvStateDir:      state,
 		EnvInstanceID:    "i",
 		EnvProjectID:     "p",
 		EnvMaxTimeout:    "20m",
@@ -284,7 +307,7 @@ func TestResolvePiProfileConflicts(t *testing.T) {
 		{"no state dir", map[string]string{EnvStateDir: ""}, "AGY_MCP_STATE_DIR is required"},
 		{"no instance id", map[string]string{EnvInstanceID: ""}, "AGY_MCP_INSTANCE_ID"},
 		{"no project id", map[string]string{EnvProjectID: ""}, "AGY_MCP_PROJECT_ID"},
-		{"no max timeout", map[string]string{EnvMaxTimeout: ""}, "AGY_MCP_MAX_TIMEOUT is required"},
+		{"no max timeout", map[string]string{EnvMaxTimeout: ""}, "AGY_MCP_MAX_TIMEOUT is set but empty"},
 		{"no default cwd", map[string]string{EnvDefaultCwd: ""}, "AGY_MCP_DEFAULT_CWD is required"},
 	}
 	for _, tc := range cases {
@@ -368,4 +391,115 @@ func equalList(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestResolvePiProfileRequiresDeploymentRecord pins the fail-closed tie
+// between the profile and its controlled launcher: without a readable,
+// matching deployment record in the state directory, a fully configured
+// profile start is refused, so a bare start, two instances sharing a state
+// directory, and a snapshot change reusing an old identity are all startup
+// errors. Removing the verifyDeploymentRecord call in Resolve turns every
+// subtest here green-when-broken.
+func TestResolvePiProfileRequiresDeploymentRecord(t *testing.T) {
+	root := dir(t)
+	state := dir(t)
+	base := func() map[string]string {
+		return map[string]string{
+			EnvProfile:      policy.ProfilePi,
+			EnvAllowedRoots: root,
+			EnvDefaultCwd:   root,
+			EnvStateDir:     state,
+			EnvInstanceID:   "inst-1",
+			EnvProjectID:    "proj-1",
+			EnvMaxTimeout:   "20m",
+		}
+	}
+	t.Run("missing record refused", func(t *testing.T) {
+		if _, err := resolveFor(t, base()); err == nil || !strings.Contains(err.Error(), "deployment record") {
+			t.Fatalf("resolve without a record = %v, want a deployment-record refusal", err)
+		}
+	})
+	t.Run("foreign identity refused", func(t *testing.T) {
+		writeRecord(t, state, "other-project", "inst-1")
+		if _, err := resolveFor(t, base()); err == nil || !strings.Contains(err.Error(), "belongs to another deployment") {
+			t.Fatalf("resolve against another project's record = %v", err)
+		}
+	})
+	t.Run("unknown contract refused", func(t *testing.T) {
+		if err := jobstore.WriteInstanceRecord(state, jobstore.InstanceRecord{
+			Contract:            jobstore.InstanceContract + 1,
+			ProjectID:           "proj-1",
+			InstanceID:          "inst-1",
+			SnapshotFingerprint: "fp",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolveFor(t, base()); err == nil || !strings.Contains(err.Error(), "contract") {
+			t.Fatalf("resolve against a future contract = %v", err)
+		}
+	})
+	t.Run("fingerprintless record refused", func(t *testing.T) {
+		if err := jobstore.WriteInstanceRecord(state, jobstore.InstanceRecord{
+			Contract:   jobstore.InstanceContract,
+			ProjectID:  "proj-1",
+			InstanceID: "inst-1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolveFor(t, base()); err == nil || !strings.Contains(err.Error(), "snapshot fingerprint") {
+			t.Fatalf("resolve against a fingerprintless record = %v", err)
+		}
+	})
+}
+
+// TestResolveMaxTimeoutExplicitNonPositiveRefused pins the explicit-value
+// contract: an explicit zero or negative AGY_MCP_MAX_TIMEOUT is a startup
+// error, not a silent read as "unset" (which would re-enable the 24h ceiling
+// while the operator believes a cap is active). An unset variable keeps the
+// upstream default, and set-but-empty is refused like the other variables.
+func TestResolveMaxTimeoutExplicitNonPositiveRefused(t *testing.T) {
+	for _, bad := range []string{"0s", "0", "-5m", ""} {
+		_, err := resolveFor(t, map[string]string{EnvMaxTimeout: bad})
+		want := "positive duration"
+		if bad == "" {
+			want = "set but empty"
+		}
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("AGY_MCP_MAX_TIMEOUT=%q err = %v, want an error containing %q", bad, err, want)
+		}
+	}
+	// Unset keeps upstream: no error, no cap.
+	if c, err := resolveFor(t, nil); err != nil || c.Policy.MaxTimeout != 0 {
+		t.Fatalf("unset max timeout = %v, %v; want no cap and no error", c.Policy.MaxTimeout, err)
+	}
+}
+
+// TestSanitizeEnvStrict pins the protected child environment: the strict
+// filter is a positive allowlist, so a secret riding on any unconsidered name
+// (not just the agy-mcp prefix) cannot reach a worker, a hook, or a probe.
+func TestSanitizeEnvStrict(t *testing.T) {
+	env := []string{
+		"HOME=/h",
+		"PATH=/bin",
+		"LANG=C.UTF-8",
+		"HTTPS_PROXY=http://proxy:3128",
+		"AGY_MCP_HTTP_TOKEN=control-plane-token",
+		"ACCEPTANCE_EXTRA_SECRET=SYNTHETIC_ONLY",
+	}
+	got := SanitizeEnvStrict(env)
+	want := []string{"HOME=/h", "PATH=/bin", "LANG=C.UTF-8", "HTTPS_PROXY=http://proxy:3128"}
+	if !equalList(sortedCopy(got), sortedCopy(want)) {
+		t.Fatalf("SanitizeEnvStrict = %q, want %q", got, want)
+	}
+	for _, kv := range got {
+		if strings.Contains(kv, "control-plane-token") || strings.Contains(kv, "SYNTHETIC_ONLY") {
+			t.Fatalf("strict env leaked %q", kv)
+		}
+	}
+}
+
+func sortedCopy(in []string) []string {
+	out := slices.Clone(in)
+	slices.Sort(out)
+	return out
 }

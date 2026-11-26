@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tphakala/agy-mcp/v2/internal/jobstore"
 	"github.com/tphakala/agy-mcp/v2/internal/policy"
 )
 
@@ -201,10 +202,20 @@ func resolvePolicy(c *Config) error {
 		}
 		p.SessionPolicy = policy.SessionPolicy(raw)
 	}
-	if raw := os.Getenv(EnvMaxTimeout); raw != "" {
+	if raw, ok := os.LookupEnv(EnvMaxTimeout); ok {
+		if raw == "" {
+			return fmt.Errorf("%s is set but empty; want a positive Go duration (0 < d <= 24h) or unset", EnvMaxTimeout)
+		}
 		d, perr := time.ParseDuration(raw)
 		if perr != nil {
 			return fmt.Errorf("%s %q: %w", EnvMaxTimeout, raw, perr)
+		}
+		// An explicit zero is a configuration error, not "no limit": a silent
+		// read as "unset" would re-enable the upstream 24h ceiling while the
+		// operator believes a cap is active. Ceiling (> 24h) is checked in
+		// ValidateAndNormalize below.
+		if d <= 0 {
+			return fmt.Errorf("%s %q: want a positive duration (0 < d <= 24h) or unset", EnvMaxTimeout, raw)
 		}
 		p.MaxTimeout = d
 	}
@@ -349,4 +360,59 @@ func SanitizeEnv(environ []string) []string {
 		kept = append(kept, kv)
 	}
 	return kept
+}
+
+// protectedChildEnvAllowlist is the whole environment a protected deployment
+// passes to any child process: what agy and its tools genuinely need to run
+// (a home, a path, locale and TLS trust, and the proxy that carries their
+// controlled egress), and nothing else. Unlike the prefix strip above, this is
+// a positive allowlist: a variable the control plane happens to hold (another
+// credential, an unrelated secret, an internal endpoint) cannot reach a child
+// by riding on an unconsidered name.
+var protectedChildEnvAllowlist = map[string]bool{
+	"HOME": true, "PATH": true,
+	"LANG": true, "LC_ALL": true, "TZ": true,
+	"SSL_CERT_FILE": true, "SSL_CERT_DIR": true,
+	"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true,
+	"http_proxy": true, "https_proxy": true, "no_proxy": true,
+}
+
+// SanitizeEnvStrict returns environ reduced to the protected allowlist. It is
+// applied to the worker environment of protected jobs (the supervisor decides
+// from the job's ownership record) and to every probe a protected instance
+// runs. Order is unstable like SanitizeEnv's, and os/exec does not care.
+func SanitizeEnvStrict(environ []string) []string {
+	kept := make([]string, 0, len(protectedChildEnvAllowlist))
+	for _, kv := range environ {
+		name, _, found := strings.Cut(kv, "=")
+		if found && protectedChildEnvAllowlist[name] {
+			kept = append(kept, kv)
+		}
+	}
+	return kept
+}
+
+// verifyDeploymentRecord loads and checks the state directory's deployment
+// record under a protected profile. It is the fail-closed tie between the
+// server and its controlled launcher (deploy/launch-pi.sh): no record, a
+// record from another contract, another identity, or one without a snapshot
+// fingerprint refuses the start, so a bare start of the pi profile, two
+// instances sharing one state directory, and a snapshot change reusing an old
+// deployment's identity are all configuration errors, not degraded starts.
+func verifyDeploymentRecord(c *Config) error {
+	rec, err := jobstore.ReadInstanceRecord(c.StateDir)
+	if err != nil {
+		return fmt.Errorf("profile %s requires the deployment record %s in the state directory %s: %w; deploy the instance with its controlled launcher (deploy/launch-pi.sh), which writes the record before the server starts", policy.ProfilePi, jobstore.InstanceRecordFile, c.StateDir, err)
+	}
+	if rec.Contract != jobstore.InstanceContract {
+		return fmt.Errorf("deployment record contract %d is not understood by this build (want %d); redeploy the instance with its launcher", rec.Contract, jobstore.InstanceContract)
+	}
+	if rec.ProjectID != c.ProjectID || rec.InstanceID != c.InstanceID {
+		return fmt.Errorf("deployment record names project %q instance %q; this server is configured for project %q instance %q: the state directory belongs to another deployment", rec.ProjectID, rec.InstanceID, c.ProjectID, c.InstanceID)
+	}
+	if rec.SnapshotFingerprint == "" {
+		return fmt.Errorf("deployment record carries no snapshot fingerprint; redeploy the instance so ownership and replays bind to a snapshot version")
+	}
+	c.SnapshotFingerprint = rec.SnapshotFingerprint
+	return nil
 }

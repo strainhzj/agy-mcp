@@ -87,6 +87,11 @@ type Config struct {
 	// not match.
 	ProjectID  string
 	InstanceID string
+	// SnapshotFingerprint is the snapshot fingerprint from the deployment
+	// record (see jobstore.InstanceRecord). It is set only under a protected
+	// profile, and is stamped into every job's ownership record so ownership
+	// and idempotent replay are bound to one snapshot version.
+	SnapshotFingerprint string
 }
 
 // baseConfig returns a Config carrying exactly the defaults shared by Resolve
@@ -172,6 +177,18 @@ func Resolve() (Config, error) {
 		return Config{}, err
 	}
 	c.StateDir = stateRoot
+
+	// The deployment record ties a protected instance to its controlled
+	// launcher (deploy/launch-pi.sh): identity and the snapshot fingerprint
+	// come from a record the launcher wrote into the state directory, never
+	// from environment an operator can hand-fill for a bare start. Checked
+	// before the concurrency override so the failure is the startup error,
+	// not a later admission surprise.
+	if c.Policy.Protected() {
+		if err := verifyDeploymentRecord(&c); err != nil {
+			return Config{}, err
+		}
+	}
 
 	// The concurrency override and the default-timeout downshift run last: the
 	// downshift needs the validated MaxTimeout, and both need the base defaults

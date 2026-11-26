@@ -176,6 +176,15 @@ func validateServeStartup(cfg config.Config, httpAddr string) error {
 	if cfg.Policy.RequireHTTPToken && cfg.HTTPToken == "" {
 		return fmt.Errorf("%s is set (or profile %s is active): set AGY_MCP_HTTP_TOKEN or pass -http-token <token>; an empty token cannot start", config.EnvRequireHTTPToken, policy.ProfilePi)
 	}
+	// A protected instance is a deployed instance: the worker must be the
+	// launcher-staged wrapper that builds the worker's namespace and rebuilds
+	// its environment, and the state directory must carry the deployment
+	// record that launcher wrote (checked in config.Resolve). A start that
+	// cannot name the staged worker is a bare start, and the profile refuses
+	// it rather than serving behind a boundary that was never assembled.
+	if protected && cfg.AgyPath == "" {
+		return fmt.Errorf("profile %s requires %s to name the launcher-staged worker path (deploy/launch-pi.sh sets it); a bare start without the controlled launcher is refused", policy.ProfilePi, config.EnvAgyPath)
+	}
 	return nil
 }
 

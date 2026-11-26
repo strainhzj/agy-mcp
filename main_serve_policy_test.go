@@ -9,13 +9,15 @@ import (
 )
 
 // protectedServeConfig is the least configuration a protected profile can
-// start with over HTTP: token-bearing, loopback-bound.
+// start with over HTTP: token-bearing, loopback-bound, and naming the
+// launcher-staged worker the profile requires.
 func protectedServeConfig() config.Config {
 	return config.Config{
 		Policy: policy.Policy{
 			Profile:          policy.ProfilePi,
 			RequireHTTPToken: true,
 		},
+		AgyPath:   "/stage/bin/agy-wrapped",
 		HTTPToken: "secret",
 	}
 }
@@ -35,6 +37,11 @@ func TestValidateServeStartup(t *testing.T) {
 		{"unrestricted http without token passes", config.Config{}, "127.0.0.1:8765", ""},
 		{"protected stdio refused", protectedServeConfig(), "", "Streamable HTTP only"},
 		{"protected http passes", protectedServeConfig(), "127.0.0.1:8765", ""},
+		{"protected http without staged worker refused", func() config.Config {
+			c := protectedServeConfig()
+			c.AgyPath = ""
+			return c
+		}(), "127.0.0.1:8765", "launcher-staged worker"},
 		{"protected http without token refused", func() config.Config {
 			c := protectedServeConfig()
 			c.HTTPToken = ""

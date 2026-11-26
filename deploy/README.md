@@ -104,6 +104,27 @@ directory is a template, not a proven boundary.
 
 ## Deploy one instance
 
+### Without systemd (a container)
+
+When the instance runs inside a container with no systemd manager (the
+usual shape on this kind of host), the unit's boundaries are prepared once
+by a root-side script and the launcher self-enrolls: a writable cgroup
+subtree with memory/cpu/pids limits, and an nftables output whitelist scoped
+to that subtree (instance outbound TCP only to the model proxy port;
+everything else kernel-dropped, worker included). Run as root:
+
+    sudo ./setup-pi-local-root.sh /sys/fs/cgroup/agy-pi-review <run-user> 3128
+
+then set `PI_CGROUP=/sys/fs/cgroup/agy-pi-review` in the instance env. The
+launcher refuses a set-but-unusable PI_CGROUP, so the ordering is: setup
+first, then launch. If the runtime forbids remounting the cgroup hierarchy
+read-write, the resource caps and the cgroup-scoped rules cannot work: fall
+back to the residuals in the checklist below and do not expose the endpoint
+without accepting them. The egress negative controls below are the
+verification either way.
+
+### With systemd
+
 1. Create the service account and the directory tree:
 
        useradd --system --home /var/lib/agy-mcp --shell /usr/sbin/nologin agy-mcp

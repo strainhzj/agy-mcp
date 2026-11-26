@@ -72,6 +72,10 @@ PI_SYNC_WAIT_CAP="${PI_SYNC_WAIT_CAP:-50s}"
 PI_SESSION_POLICY="${PI_SESSION_POLICY:-disabled}"
 PI_SESSION_TTL="${PI_SESSION_TTL:-168h}"
 PI_GEMINI_TMPFS_SIZE="${PI_GEMINI_TMPFS_SIZE:-256MiB}"
+# Optional cgroup subtree the whole instance tree self-enrolls into (resource
+# caps plus the nft egress whitelist scope). Prepared by the root-side setup
+# script on hosts without systemd; unset keeps upstream behavior.
+PI_CGROUP="${PI_CGROUP:-}"
 
 # Locale and timezone are baked into the generated scripts, so their values
 # must be ones a single-quoted shell string can carry safely; anything odd
@@ -124,6 +128,11 @@ case "$PI_SESSION_POLICY" in
     disabled|managed-only) ;;
     *) die "PI_SESSION_POLICY must be disabled or managed-only" ;;
 esac
+if [ -n "$PI_CGROUP" ]; then
+    case "$PI_CGROUP" in /*) ;; *) die "PI_CGROUP must be an absolute path" ;; esac
+    [ -d "$PI_CGROUP" ] || die "PI_CGROUP $PI_CGROUP does not exist; run the root-side setup (deploy/setup-pi-local-root.sh) first"
+    [ -w "$PI_CGROUP/cgroup.procs" ] || die "PI_CGROUP $PI_CGROUP is not writable by this user; the root-side setup must chown the subtree to the running user"
+fi
 if [ -n "$PI_AGY_CONFIG_DIR" ]; then
     [ -d "$PI_AGY_CONFIG_DIR" ] || die "PI_AGY_CONFIG_DIR $PI_AGY_CONFIG_DIR does not exist"
     # The service identity is staged under the control dir so the outer
@@ -358,6 +367,12 @@ chmod 555 "$stage/bin/agy-wrapped"
     printf 'export AGY_MCP_REQUIRE_HTTP_TOKEN=true\n'
     printf 'export AGY_MCP_HTTP_TOKEN="$(cat /stage/run-control/token)"\n'
     printf 'export AGY_MCP_AGY_PATH=/stage/bin/agy-wrapped\n'
+    if [ -n "$PI_CGROUP" ]; then
+        printf '# Enroll this process tree into the prepared cgroup subtree: resource\n'
+        printf '# caps and the nft egress whitelist scope apply from here on, worker\n'
+        printf '# included (membership is inherited).\n'
+        printf 'echo "$$" > /cgroup/cgroup.procs\n'
+    fi
     printf 'exec /stage/bin/agy-mcp -http "%s"\n' "$PI_LISTEN_ADDR"
 } > "$stage/launch.sh"
 chmod 555 "$stage/launch.sh"
@@ -365,6 +380,15 @@ chmod 555 "$stage/launch.sh"
 # ---------------------------------------------------------------------------
 # Launch the control plane inside the outer namespace.
 # ---------------------------------------------------------------------------
+
+# The instance's cgroup subtree is bound read-write into the control plane's
+# view (at the fixed path /cgroup) so the generated entrypoint can enroll the
+# server into it; membership is inherited by every child, worker included.
+# The worker's inner namespace binds none of it.
+CG_BIND=""
+if [ -n "$PI_CGROUP" ]; then
+    CG_BIND="--bind $PI_CGROUP /cgroup"
+fi
 
 exec "$PI_BWRAP" \
     --clearenv \
@@ -386,6 +410,7 @@ exec "$PI_BWRAP" \
     --bind "$PI_STATE_DIR" /state \
     --ro-bind "$stage" /stage \
     --ro-bind-try "$PI_CONTROL_DIR/gemini" /seed \
+    $CG_BIND \
     --die-with-parent \
     --new-session \
     -- \

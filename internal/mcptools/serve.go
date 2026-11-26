@@ -35,10 +35,24 @@ func ServeStdio(ctx context.Context, mgr *manager.Manager) error {
 // <token> header is rejected with 401. An empty token leaves HTTP mode
 // unauthenticated (the default).
 func HTTPHandler(mgr *manager.Manager, token string) http.Handler {
+	// The transport limits (idle session timeout and friends) come from the
+	// resolved policy; zero limits leave the options nil, which is exactly the
+	// SDK's upstream default behavior. Request size is bounded by the SDK's
+	// own default body cap (4 MiB).
+	var opts *mcp.StreamableHTTPOptions
+	if mgr != nil {
+		if g := mgr.HTTPGuard(); g.Limited() {
+			opts = &mcp.StreamableHTTPOptions{SessionTimeout: g.SessionTimeout}
+		}
+	}
 	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return NewServer(mgr)
-	}, nil)
-	return withBearerAuth(token, http.NewCrossOriginProtection().Handler(streamable))
+	}, opts)
+	var h http.Handler = streamable
+	if mgr != nil {
+		h = installGuard(mgr.HTTPGuard(), h)
+	}
+	return withBearerAuth(token, http.NewCrossOriginProtection().Handler(h))
 }
 
 // withBearerAuth wraps h to require Authorization: Bearer <token>. An empty token

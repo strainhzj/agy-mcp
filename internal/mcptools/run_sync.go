@@ -8,6 +8,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tphakala/agy-mcp/v2/internal/config"
 	"github.com/tphakala/agy-mcp/v2/internal/manager"
+	"github.com/tphakala/agy-mcp/v2/internal/policy"
 )
 
 // The built-in inline-wait ceiling for agy_run_sync and agy_wait now lives in
@@ -54,12 +55,15 @@ type runSyncOutput struct {
 func registerRunSync(s *mcp.Server, mgr *manager.Manager) {
 	// mgr may be nil (the tool-list tests connect without one); a nil manager
 	// means the unrestricted description, like a zero policy would.
-	protected := mgr != nil && mgr.Policy().Protected()
+	pol := policy.Policy{}
+	if mgr != nil {
+		pol = mgr.Policy()
+	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        toolAgyRunSync,
 		Title:       "Delegate to agy (wait inline)",
 		Annotations: annDelegate,
-		Description: toolDescription(protected, "Delegate a prompt to an agy model and wait for the result inline (bounded by wait). "+
+		Description: runDescription(pol, "Delegate a prompt to an agy model and wait for the result inline (bounded by wait). "+
 			"Use when the answer is needed before your next step AND the task is bounded enough to finish within the wait: "+
 			"a focused peer review, a second opinion, a rubber-duck question. "+
 			"For open-ended work that routinely runs past the wait cap (web research, a whole-codebase review), "+
@@ -70,7 +74,7 @@ func registerRunSync(s *mcp.Server, mgr *manager.Manager) {
 			"The delegated agent runs with permission checks disabled: it can edit files under cwd and under any "+
 			"dirs, can create files outside them by absolute path, and may reach the network. "+
 			"Say so in the prompt if the run must not touch the repo. "+
-			"For work that may be skipped (a peer review, a second opinion, a rubber-duck pass), check agy_usage and pass priority optional so the run is refused while quota is low.", protectedAgyRunSyncDescription),
+			"For work that may be skipped (a peer review, a second opinion, a rubber-duck pass), check agy_usage and pass priority optional so the run is refused while quota is low.", protectedAgyRunSyncDescription, protectedAgyRunSyncManagedDescription),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in runSyncInput) (*mcp.CallToolResult, runSyncOutput, error) {
 		wait, err := parseWait(in.Wait)
 		if err != nil {

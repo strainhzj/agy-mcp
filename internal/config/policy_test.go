@@ -55,6 +55,8 @@ func clearPolicyEnv(t *testing.T) {
 		EnvDisableContinueLatest, EnvDisableAgentSelection, EnvAllowedAgents,
 		EnvAllowedModels, EnvMaxTimeout, EnvMaxConcurrency, EnvRequireHTTPToken,
 		EnvInstanceID, EnvProjectID, EnvStateDir,
+		EnvHTTPSessionTimeout, EnvHTTPMaxSessions, EnvHTTPMaxInflight,
+		EnvHTTPRatePerSec, EnvStateBudget, EnvSessionTTL,
 	} {
 		old, had := os.LookupEnv(name)
 		// Best-effort env surgery in a test: a failure here is a broken test
@@ -502,4 +504,185 @@ func sortedCopy(in []string) []string {
 	out := slices.Clone(in)
 	slices.Sort(out)
 	return out
+}
+
+// TestResolveUnsetLimitsKeepUpstreamOff extends the upstream-compat gate to
+// the new limits: with no policy variable set, the HTTP guard is zero, the
+// state budget is off, and no session TTL exists.
+func TestResolveUnsetLimitsKeepUpstreamOff(t *testing.T) {
+	c, err := resolveFor(t, nil)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if c.HTTPGuard.Limited() || c.StateBudgetBytes != 0 || c.SessionTTL != 0 {
+		t.Fatalf("unset environment produced limits: guard %+v budget %d ttl %s", c.HTTPGuard, c.StateBudgetBytes, c.SessionTTL)
+	}
+}
+
+// TestResolvePiProfileLimitDefaults pins the profile defaults: an operator who
+// sets no limit variable still gets bounded sessions, in-flight work, request
+// rate and a disk budget, because the plan requires the caps by default, not
+// by opt-in.
+func TestResolvePiProfileLimitDefaults(t *testing.T) {
+	root := dir(t)
+	state := dir(t)
+	writeRecord(t, state, "p", "i")
+	c, err := resolveFor(t, map[string]string{
+		EnvProfile:      policy.ProfilePi,
+		EnvAllowedRoots: root,
+		EnvDefaultCwd:   root,
+		EnvStateDir:     state,
+		EnvInstanceID:   "i",
+		EnvProjectID:    "p",
+		EnvMaxTimeout:   "20m",
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	g := c.HTTPGuard
+	if g.SessionTimeout != DefaultHTTPSessionTimeout || g.MaxSessions != DefaultHTTPMaxSessions ||
+		g.MaxInflight != DefaultHTTPMaxInflight || g.RatePerSec != DefaultHTTPRatePerSec {
+		t.Fatalf("profile guard defaults wrong: %+v", g)
+	}
+	if c.StateBudgetBytes != DefaultStateBudget {
+		t.Fatalf("state budget %d, want %d", c.StateBudgetBytes, DefaultStateBudget)
+	}
+	if c.SessionTTL != 0 {
+		t.Fatalf("session ttl %s set without managed-only", c.SessionTTL)
+	}
+}
+
+// TestResolveExplicitLimits parsed as set, independent of any profile.
+func TestResolveExplicitLimits(t *testing.T) {
+	c, err := resolveFor(t, map[string]string{
+		EnvHTTPSessionTimeout: "12m",
+		EnvHTTPMaxSessions:    "8",
+		EnvHTTPMaxInflight:    "4",
+		EnvHTTPRatePerSec:     "5.5",
+		EnvStateBudget:        "512MiB",
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	g := c.HTTPGuard
+	if g.SessionTimeout != 12*time.Minute || g.MaxSessions != 8 || g.MaxInflight != 4 || g.RatePerSec != 5.5 {
+		t.Fatalf("guard = %+v", g)
+	}
+	if c.StateBudgetBytes != 512<<20 {
+		t.Fatalf("state budget %d, want 512MiB", c.StateBudgetBytes)
+	}
+}
+
+// TestResolveManagedOnlySessionTTL pins the Phase 3 TTL rules: the profile
+// with managed-only gets the default when unset, honors an explicit positive
+// value, and anything else with the variable set is refused.
+func TestResolveManagedOnlySessionTTL(t *testing.T) {
+	profileEnv := func(extra map[string]string) map[string]string {
+		root := dir(t)
+		state := dir(t)
+		writeRecord(t, state, "p", "i")
+		set := map[string]string{
+			EnvProfile:       policy.ProfilePi,
+			EnvAllowedRoots:  root,
+			EnvDefaultCwd:    root,
+			EnvStateDir:      state,
+			EnvInstanceID:    "i",
+			EnvProjectID:     "p",
+			EnvMaxTimeout:    "20m",
+			EnvSessionPolicy: string(policy.SessionPolicyManagedOnly),
+		}
+		maps.Copy(set, extra)
+		return set
+	}
+	c, err := resolveFor(t, profileEnv(nil))
+	if err != nil {
+		t.Fatalf("managed-only resolve: %v", err)
+	}
+	if c.SessionTTL != DefaultSessionTTL {
+		t.Fatalf("ttl %s, want default %s", c.SessionTTL, DefaultSessionTTL)
+	}
+	c, err = resolveFor(t, profileEnv(map[string]string{EnvSessionTTL: "48h"}))
+	if err != nil {
+		t.Fatalf("managed-only resolve with ttl: %v", err)
+	}
+	if c.SessionTTL != 48*time.Hour {
+		t.Fatalf("ttl %s, want 48h", c.SessionTTL)
+	}
+	for _, tc := range []struct {
+		name string
+		set  map[string]string
+		want string
+	}{
+		{"zero ttl", map[string]string{EnvSessionTTL: "0"}, "want a positive duration or unset"},
+		{"negative ttl", map[string]string{EnvSessionTTL: "-5m"}, "want a positive duration or unset"},
+		{"ttl without managed-only", map[string]string{EnvSessionTTL: "48h", EnvSessionPolicy: "disabled"}, "only valid together with"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := resolveFor(t, profileEnv(tc.set)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// TestResolveManagedOnlyRequiresProfile pins that handles never resolve
+// outside a protected deployment: their records name a project, an instance
+// and a snapshot version, which an unprotected server cannot supply.
+func TestResolveManagedOnlyRequiresProfile(t *testing.T) {
+	_, err := resolveFor(t, map[string]string{EnvSessionPolicy: string(policy.SessionPolicyManagedOnly)})
+	if err == nil || !strings.Contains(err.Error(), "requires profile") {
+		t.Fatalf("want requires-profile error, got %v", err)
+	}
+}
+
+// TestResolveLimitErrors covers the fail-closed parses of the new limits.
+func TestResolveLimitErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		set  map[string]string
+		want string
+	}{
+		{"zero session timeout", map[string]string{EnvHTTPSessionTimeout: "0"}, "want a positive duration or unset"},
+		{"negative inflight", map[string]string{EnvHTTPMaxInflight: "-1"}, "want a positive integer or unset"},
+		{"sessions without timeout", map[string]string{EnvHTTPMaxSessions: "8"}, "requires " + EnvHTTPSessionTimeout},
+		{"bad rate", map[string]string{EnvHTTPRatePerSec: "fast"}, "want a positive number or unset"},
+		{"zero rate", map[string]string{EnvHTTPRatePerSec: "0"}, "want a positive number or unset"},
+		{"bad budget unit", map[string]string{EnvStateBudget: "5ligabytes"}, "KiB, MiB, GiB or TiB suffix"},
+		{"zero budget", map[string]string{EnvStateBudget: "0"}, "want a positive byte count"},
+		{"negative budget", map[string]string{EnvStateBudget: "-2GiB"}, "want a positive byte count"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := resolveFor(t, tc.set); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// TestParseByteSize pins the byte-size grammar AGY_MCP_STATE_BUDGET accepts.
+func TestParseByteSize(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want int64
+	}{
+		{"1024", 1024},
+		{"1KiB", 1 << 10},
+		{"512MiB", 512 << 20},
+		{"2GiB", 2 << 30},
+		{"2gib", 2 << 30},
+		{"1TiB", 1 << 40},
+		{" 3 MiB ", 3 << 20},
+	}
+	for _, tc := range cases {
+		got, err := parseByteSize(EnvStateBudget, tc.raw)
+		if err != nil || got != tc.want {
+			t.Fatalf("parseByteSize(%q) = %d, %v; want %d", tc.raw, got, err, tc.want)
+		}
+	}
+	for _, raw := range []string{"", "MiB", "5XB", "abc", "-1GiB", "0"} {
+		if _, err := parseByteSize(EnvStateBudget, raw); err == nil {
+			t.Fatalf("parseByteSize(%q) unexpectedly succeeded", raw)
+		}
+	}
 }

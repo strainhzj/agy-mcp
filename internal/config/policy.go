@@ -60,6 +60,27 @@ const (
 	// agy_wait. It lives here (not with its reader in mcptools) so the doctor
 	// can report how it resolved without an import cycle.
 	EnvSyncWaitCap = "AGY_MCP_SYNC_WAIT_CAP"
+	// EnvHTTPSessionTimeout is the idle timeout after which the HTTP transport
+	// closes a session that has sent no request. Zero (unset) keeps the SDK's
+	// upstream behavior, where idle sessions are never closed.
+	EnvHTTPSessionTimeout = "AGY_MCP_HTTP_SESSION_TIMEOUT"
+	// EnvHTTPMaxSessions caps the distinct MCP sessions a server will track.
+	// Zero (unset) means unlimited. It requires a session timeout: without one
+	// a cap can never be relaxed because idle sessions never leave.
+	EnvHTTPMaxSessions = "AGY_MCP_HTTP_MAX_SESSIONS"
+	// EnvHTTPMaxInflight caps the HTTP requests the server processes at once.
+	// Zero (unset) means unlimited.
+	EnvHTTPMaxInflight = "AGY_MCP_HTTP_MAX_INFLIGHT"
+	// EnvHTTPRatePerSec caps authenticated requests per second with a token
+	// bucket whose burst equals the rate. Zero (unset) means unlimited.
+	EnvHTTPRatePerSec = "AGY_MCP_HTTP_RATE_PER_SEC"
+	// EnvStateBudget bounds the job store's total size on disk, for example
+	// "2GiB". Zero (unset) disables the budget.
+	EnvStateBudget = "AGY_MCP_STATE_BUDGET"
+	// EnvSessionTTL is how long a managed-only session handle stays
+	// resolvable, independent of JobTTL. It is only valid together with
+	// AGY_MCP_SESSION_POLICY=managed-only.
+	EnvSessionTTL = "AGY_MCP_SESSION_TTL"
 )
 
 // DefaultSyncWaitCap is the built-in inline-wait ceiling: below the ~120s
@@ -68,6 +89,41 @@ const (
 // call. mcptools clamps against ResolveSyncWaitCap, which returns this when
 // EnvSyncWaitCap is unset or unparseable.
 const DefaultSyncWaitCap = 90 * time.Second
+
+// Defaults a protected profile applies when the corresponding limit is left
+// unset. Upstream (no profile) every limit defaults to off, so none of these
+// change an unprotected server's behavior.
+const (
+	DefaultHTTPSessionTimeout = 15 * time.Minute
+	DefaultHTTPMaxSessions    = 16
+	DefaultHTTPMaxInflight    = 8
+	DefaultHTTPRatePerSec     = 20.0
+	DefaultStateBudget        = int64(2) << 30 // 2 GiB
+	DefaultSessionTTL         = 7 * 24 * time.Hour
+)
+
+// HTTPGuard carries the resolved HTTP transport limits. The zero value means
+// every limit is off, which is upstream behavior; an unset limit under a
+// protected profile takes the profile default instead.
+type HTTPGuard struct {
+	// SessionTimeout closes an idle MCP session after this long. Zero keeps
+	// the SDK default (idle sessions are never closed).
+	SessionTimeout time.Duration
+	// MaxSessions caps the distinct MCP sessions the server tracks; it
+	// requires SessionTimeout, because only a timeout ever retires a session.
+	MaxSessions int
+	// MaxInflight caps requests the server processes concurrently.
+	MaxInflight int
+	// RatePerSec caps authenticated requests per second (token bucket, burst
+	// equal to the rate). Zero disables rate limiting.
+	RatePerSec float64
+}
+
+// Limited reports whether any limit is active, so the HTTP layer can skip the
+// guard middleware entirely for an unrestricted server.
+func (g HTTPGuard) Limited() bool {
+	return g.SessionTimeout > 0 || g.MaxSessions > 0 || g.MaxInflight > 0 || g.RatePerSec > 0
+}
 
 // ResolveSyncWaitCap resolves the effective inline-wait ceiling from getenv.
 // An unparseable or non-positive value silently falls back to the default,
@@ -201,6 +257,9 @@ func resolvePolicy(c *Config) error {
 			return fmt.Errorf("%s is set but empty; want allow, managed-only or disabled", EnvSessionPolicy)
 		}
 		p.SessionPolicy = policy.SessionPolicy(raw)
+		if p.SessionPolicy == policy.SessionPolicyManagedOnly && !p.Protected() {
+			return fmt.Errorf("%s=%s requires profile %s: handles are bound to a deployment's project, instance and snapshot version", EnvSessionPolicy, policy.SessionPolicyManagedOnly, policy.ProfilePi)
+		}
 	}
 	if raw, ok := os.LookupEnv(EnvMaxTimeout); ok {
 		if raw == "" {
@@ -225,6 +284,15 @@ func resolvePolicy(c *Config) error {
 	if c.ProjectID, err = requiredIdentity(EnvProjectID); err != nil {
 		return err
 	}
+	if c.SessionTTL, err = resolveSessionTTL(p); err != nil {
+		return err
+	}
+	if c.HTTPGuard, err = resolveHTTPGuard(p); err != nil {
+		return err
+	}
+	if c.StateBudgetBytes, err = resolveStateBudget(p); err != nil {
+		return err
+	}
 
 	if p.Protected() {
 		if err := applyProfileRequirements(c); err != nil {
@@ -232,6 +300,180 @@ func resolvePolicy(c *Config) error {
 		}
 	}
 	return p.ValidateAndNormalize()
+}
+
+// resolveSessionTTL resolves the managed-only handle expiry. It is only
+// valid together with the managed-only session policy: anywhere else an unset
+// variable stays zero and a set one is refused, so a typo cannot silently
+// attach an expiry to a policy that has no handles.
+func resolveSessionTTL(p *policy.Policy) (time.Duration, error) {
+	raw, set := os.LookupEnv(EnvSessionTTL)
+	if !set || raw == "" {
+		if p.SessionPolicy == policy.SessionPolicyManagedOnly {
+			return DefaultSessionTTL, nil
+		}
+		return 0, nil
+	}
+	if p.SessionPolicy != policy.SessionPolicyManagedOnly {
+		return 0, fmt.Errorf("%s is only valid together with %s=%s", EnvSessionTTL, EnvSessionPolicy, policy.SessionPolicyManagedOnly)
+	}
+	d, perr := time.ParseDuration(raw)
+	if perr != nil {
+		return 0, fmt.Errorf("%s %q: %w", EnvSessionTTL, raw, perr)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s %q: want a positive duration or unset", EnvSessionTTL, raw)
+	}
+	return d, nil
+}
+
+// resolveHTTPGuard resolves the HTTP transport limits. An unset limit is off
+// upstream and takes the profile default under a protected profile; a set
+// limit must be positive, because an explicit zero would read as "off" to an
+// operator who believes a cap is active (the same reading MAX_TIMEOUT refuses).
+func resolveHTTPGuard(p *policy.Policy) (HTTPGuard, error) {
+	var g HTTPGuard
+	var err error
+	if g.SessionTimeout, _, err = lookupPositiveDuration(EnvHTTPSessionTimeout); err != nil {
+		return g, err
+	}
+	if g.MaxSessions, _, err = lookupPositiveInt(EnvHTTPMaxSessions); err != nil {
+		return g, err
+	}
+	if g.MaxInflight, _, err = lookupPositiveInt(EnvHTTPMaxInflight); err != nil {
+		return g, err
+	}
+	if g.RatePerSec, _, err = lookupPositiveFloat(EnvHTTPRatePerSec); err != nil {
+		return g, err
+	}
+	if p.Protected() {
+		if g.SessionTimeout == 0 {
+			g.SessionTimeout = DefaultHTTPSessionTimeout
+		}
+		if g.MaxSessions == 0 {
+			g.MaxSessions = DefaultHTTPMaxSessions
+		}
+		if g.MaxInflight == 0 {
+			g.MaxInflight = DefaultHTTPMaxInflight
+		}
+		if g.RatePerSec == 0 {
+			g.RatePerSec = DefaultHTTPRatePerSec
+		}
+	}
+	if g.MaxSessions > 0 && g.SessionTimeout <= 0 {
+		return g, fmt.Errorf("%s requires %s: without an idle timeout a session is never retired, so the cap could only ever tighten", EnvHTTPMaxSessions, EnvHTTPSessionTimeout)
+	}
+	return g, nil
+}
+
+// resolveStateBudget resolves the job store's disk budget. Unset is off
+// upstream and takes the profile default under a protected profile; an
+// explicit value must parse and be positive.
+func resolveStateBudget(p *policy.Policy) (int64, error) {
+	raw, set := os.LookupEnv(EnvStateBudget)
+	if !set || raw == "" {
+		if p.Protected() {
+			return DefaultStateBudget, nil
+		}
+		return 0, nil
+	}
+	n, err := parseByteSize(EnvStateBudget, raw)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// byteSizeUnits are the accepted binary size suffixes for AGY_MCP_STATE_BUDGET,
+// longest first so "KiB" is never read as "B".
+var byteSizeUnits = []struct {
+	suffix string
+	mult   int64
+}{
+	{"tib", 1 << 40}, {"gib", 1 << 30}, {"mib", 1 << 20}, {"kib", 1 << 10}, {"b", 1},
+}
+
+// parseByteSize parses a byte count like "512MiB", "2GiB" or a bare integer
+// (bytes). A zero or negative value is a configuration error, not "off": the
+// way to disable the budget is to leave the variable unset.
+func parseByteSize(name, raw string) (int64, error) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	for _, u := range byteSizeUnits {
+		if !strings.HasSuffix(s, u.suffix) {
+			continue
+		}
+		num := strings.TrimSpace(strings.TrimSuffix(s, u.suffix))
+		if num == "" {
+			break
+		}
+		f, perr := strconv.ParseFloat(num, 64)
+		if perr != nil {
+			break
+		}
+		n := int64(f * float64(u.mult))
+		if n <= 0 || f <= 0 {
+			return 0, fmt.Errorf("%s %q: want a positive byte count (for example 512MiB or 2GiB) or unset", name, raw)
+		}
+		return n, nil
+	}
+	// No usable suffix: a bare integer counts as bytes, and anything else is
+	// the grammar error.
+	if f, perr := strconv.ParseFloat(s, 64); perr == nil {
+		if f <= 0 {
+			return 0, fmt.Errorf("%s %q: want a positive byte count (for example 512MiB or 2GiB) or unset", name, raw)
+		}
+		return int64(f), nil
+	}
+	return 0, fmt.Errorf("%s %q: want a byte count with a B, KiB, MiB, GiB or TiB suffix (for example 512MiB or 2GiB), or unset", name, raw)
+}
+
+// lookupPositiveDuration parses one duration variable that must be positive
+// when set. An unset variable returns (0, false, nil).
+func lookupPositiveDuration(name string) (time.Duration, bool, error) {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return 0, false, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, true, fmt.Errorf("%s %q: %w", name, raw, err)
+	}
+	if d <= 0 {
+		return 0, true, fmt.Errorf("%s %q: want a positive duration or unset", name, raw)
+	}
+	return d, true, nil
+}
+
+// lookupPositiveInt parses one integer variable that must be positive when set.
+func lookupPositiveInt(name string) (int, bool, error) {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return 0, false, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, true, fmt.Errorf("%s %q: %w", name, raw, err)
+	}
+	if n <= 0 {
+		return 0, true, fmt.Errorf("%s %q: want a positive integer or unset", name, raw)
+	}
+	return n, true, nil
+}
+
+// lookupPositiveFloat parses one float variable that must be positive when set.
+func lookupPositiveFloat(name string) (float64, bool, error) {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return 0, false, nil
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil {
+		return 0, true, fmt.Errorf("%s %q: want a positive number or unset", name, raw)
+	}
+	if f <= 0 {
+		return 0, true, fmt.Errorf("%s %q: want a positive number or unset", name, raw)
+	}
+	return f, true, nil
 }
 
 // requiredIdentity reads a deployment-assigned identity. It is optional
@@ -294,7 +536,7 @@ func applyProfileRequirements(c *Config) error {
 		return fmt.Errorf("%s is required under profile %s: set it to the project snapshot root", EnvDefaultCwd, policy.ProfilePi)
 	}
 	if p.SessionPolicy == policy.SessionPolicyAllow {
-		return fmt.Errorf("%s=%s conflicts with profile %s, which never exposes host conversation caches", EnvSessionPolicy, policy.SessionPolicyAllow, policy.ProfilePi)
+		return fmt.Errorf("%s=%s conflicts with profile %s, which never exposes host conversation caches; use disabled, or managed-only (with %s) for Phase 3 continuation handles", EnvSessionPolicy, policy.SessionPolicyAllow, policy.ProfilePi, EnvSessionTTL)
 	}
 	if p.SessionPolicy == "" {
 		p.SessionPolicy = policy.SessionPolicyDisabled

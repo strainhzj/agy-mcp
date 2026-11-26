@@ -77,6 +77,24 @@ type Config struct {
 	QuotaLow      float64
 	QuotaCritical float64
 
+	// HTTPGuard carries the HTTP transport limits (session idle timeout, session
+	// count, in-flight requests, request rate). The zero value disables every
+	// limit, which is upstream behavior; a protected profile applies its own
+	// defaults. See policy.go in this package for the variables that feed it.
+	HTTPGuard HTTPGuard
+
+	// StateBudgetBytes bounds the job store's total size on disk. When the
+	// store exceeds it, the GC pass evicts the oldest removable terminal jobs
+	// until it fits. Zero disables the budget (upstream behavior); jobs a live
+	// supervisor still owns are never evicted.
+	StateBudgetBytes int64
+
+	// SessionTTL is how long a managed-only session handle stays resolvable.
+	// It is independent of JobTTL: a job dir may be collected long before the
+	// handle it produced expires. Only meaningful with SessionPolicy managed-only,
+	// where Resolve gives it the default when unset.
+	SessionTTL time.Duration
+
 	// Policy is the resolved deployment policy (see internal/policy and
 	// policy.go in this package). The zero value keeps upstream behavior.
 	Policy policy.Policy

@@ -7,6 +7,15 @@
 # the instance - server, supervisor, worker, hooks - lives in this unit's
 # cgroup, and KillMode=control-group reclaims the whole tree on stop, not
 # just the foreground process.
+#
+# Requires a dedicated service account (the unit refuses to run as root,
+# because a root control plane would let a worker that escapes its
+# namespaces read the token and the job store straight off the disk):
+#   useradd --system --home /var/lib/agy-mcp --shell /usr/sbin/nologin agy-mcp
+#   chown -R agy-mcp:agy-mcp /var/lib/agy-mcp
+# and read access for that account to the snapshot directory (for example:
+#   chgrp -R agy-mcp /srv/workspaces/pi && chmod -R g+rX /srv/workspaces/pi
+# or serve the snapshot from a directory the account owns).
 
 [Unit]
 Description=agy-mcp protected pi instance %i
@@ -15,6 +24,8 @@ Wants=network-online.target
 
 [Service]
 Type=exec
+User=agy-mcp
+Group=agy-mcp
 # The manifest is root-owned, 0600: it names paths, not secrets, but keeping
 # it private is the cheaper habit. The launcher itself sources nothing from
 # the workspace.
@@ -33,11 +44,35 @@ TimeoutStopSec=30s
 LimitNPROC=256
 MemoryMax=1G
 TasksMax=128
+# Per-instance CPU budget. The worker's CPU lives here too, so one project
+# cannot pin the host. Adjust per project; the value must cover the model
+# client (agy) plus the control plane at the configured concurrency.
+CPUQuota=200%
+
+# Controlled egress: the allowlist below is the enforced network boundary for
+# everything in this cgroup (worker included), applied by the kernel's cgroup
+# BPF, not by environment variables a hook could drop. Deny everything, then
+# allow exactly what the instance needs:
+#   - loopback, so the host-side bridge can reach the server's 127.0.0.1
+#     endpoint and internal IPC keeps working;
+#   - the egress proxy that carries agy's model traffic (add one line per
+#     proxy address, e.g. IPAddressAllow=192.168.5.60), plus the model
+#     endpoints themselves when agy talks to them directly.
+# Out of the box (localhost only) the instance has NO external egress: a job
+# that needs the model fails fast until you allow its route. Operators whose
+# systemd lacks cgroup BPF support get a unit that fails to start rather than
+# an unfiltered one. DNS: prefer IP literals in PI_PROXY_URL; a hostname adds
+# a resolver dependency this allowlist does not cover by default.
+IPAddressDeny=any
+IPAddressAllow=localhost
 
 # Hardening that does not fight the sandbox: the launcher and bubblewrap need
 # to create mount and user namespaces, so PrivateDevices/PrivateTmp etc. are
 # deliberately not used here; the sandboxes provide stricter versions of the
-# same limits with mount sets the launcher controls.
+# same limits with mount sets the launcher controls. Note that
+# NoNewPrivileges=true means the bubblewrap binary must work unprivileged
+# (user namespaces enabled, or the setuid-less wrapper your distro ships);
+# a setuid-root bubblewrap is refused under this unit by design.
 ProtectHome=read-only
 ProtectSystem=strict
 ReadWritePaths=/var/lib/agy-mcp

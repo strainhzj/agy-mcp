@@ -33,10 +33,13 @@
 #
 # Isolation claims this script does NOT make: the mount set has been
 # smoke-tested (nested bwrap starts, masked directories stay masked), not
-# deployment-verified. The Phase 1 acceptance checklist in deploy/README.md
-# (synthetic credentials, egress targets, restart recovery) is what turns
-# this script into a verified boundary. Until that checklist passes on your
-# host, treat this file as a template, not a proven boundary.
+# deployment-verified. The worker namespace is a PID namespace, so when the
+# worker's bwrap exits (cancel, timeout, supervisor death) the kernel reaps
+# every process left inside it, including setsid descendants no process-group
+# kill could reach; that reclaim path and the rest of the boundary still
+# belong to the Phase 1 acceptance checklist in deploy/README.md. Until that
+# checklist passes on your host, treat this file as a template, not a proven
+# boundary.
 
 set -eu
 
@@ -45,6 +48,9 @@ set -eu
 # ---------------------------------------------------------------------------
 
 : "${PI_PROJECT_ID:?set PI_PROJECT_ID (the deployment-assigned project id)}"
+case "$PI_PROJECT_ID" in
+    *[!A-Za-z0-9._-]*) die "PI_PROJECT_ID must be letters, digits, dot, dash or underscore; it is baked into the deployment record" ;;
+esac
 : "${PI_SNAPSHOT_DIR:?set PI_SNAPSHOT_DIR (the host directory the read-only snapshot is served from)}"
 : "${PI_STATE_DIR:?set PI_STATE_DIR (this instance's private job-state directory)}"
 : "${PI_CONTROL_DIR:?set PI_CONTROL_DIR (the launcher's private control-plane directory)}"
@@ -57,6 +63,30 @@ PI_PROXY_URL="${PI_PROXY_URL:-}"
 PI_MAX_TIMEOUT="${PI_MAX_TIMEOUT:-20m}"
 PI_MAX_CONCURRENCY="${PI_MAX_CONCURRENCY:-2}"
 PI_SYNC_WAIT_CAP="${PI_SYNC_WAIT_CAP:-50s}"
+
+# Locale and timezone are baked into the generated scripts, so their values
+# must be ones a single-quoted shell string can carry safely; anything odd
+# falls back to a safe default instead of reaching the sandbox.
+sanitize_word() {
+    case "$1" in
+        "") printf '%s\n' "$2" ;;
+        *[!A-Za-z0-9._@/+-]*) printf '%s\n' "$2" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+PI_LANG=$(sanitize_word "${LANG:-}" "C.UTF-8")
+PI_TZ=$(sanitize_word "${TZ:-}" "UTC")
+if [ -n "$PI_PROXY_URL" ]; then
+    case "$PI_PROXY_URL" in
+        http://*|https://*) ;;
+        *) die "PI_PROXY_URL must be an http(s) URL" ;;
+    esac
+    case "$PI_PROXY_URL" in
+        # note: no '&' in the allowed set; dash cannot parse it in a case
+        # pattern and a proxy URL with a query string can be percent-encoded.
+        *[!A-Za-z0-9.:/_?=%@+-]*) die "PI_PROXY_URL contains characters the launcher will not bake into a script" ;;
+    esac
+fi
 
 # ---------------------------------------------------------------------------
 # Precondition checks (fail closed).
@@ -83,10 +113,22 @@ if [ -n "$PI_AGY_CONFIG_DIR" ]; then
     [ -d "$PI_AGY_CONFIG_DIR" ] || die "PI_AGY_CONFIG_DIR $PI_AGY_CONFIG_DIR does not exist"
     # The service identity is staged under the control dir so the outer
     # namespace can mount it at a fixed path for the worker view; the
-    # launcher re-points its snapshot at the staged copy.
+    # launcher re-points its snapshot at the staged copy. Replace the staged
+    # copy whole: a cp -a into an existing directory would nest a second
+    # .gemini inside the old one instead of updating it.
     mkdir -p "$PI_CONTROL_DIR"
+    rm -rf "$PI_CONTROL_DIR/gemini"
     cp -a "$PI_AGY_CONFIG_DIR" "$PI_CONTROL_DIR/gemini"
 fi
+
+# Fingerprint the snapshot the deployment serves. The fingerprint binds job
+# ownership and idempotent replay to one snapshot version (the server refuses
+# both across versions), so it must change when the served content changes:
+# the hash covers the path, size and mtime of every file and directory in the
+# tree. Cost is one pass over the snapshot at launch time, which is the price
+# of making a redeploy a new deployment instead of a silent continuation.
+PI_SNAPSHOT_FINGERPRINT=$(cd "$PI_SNAPSHOT_DIR" && find . -xdev \( -type f -o -type d \) -printf '%y %p %s %T@\n' 2>/dev/null | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+[ -n "$PI_SNAPSHOT_FINGERPRINT" ] || die "cannot fingerprint the snapshot dir $PI_SNAPSHOT_DIR"
 
 # Nested namespaces: the worker view nests bwrap. MEASURED against this
 # host's bwrap build: nesting starts and one masked directory stays masked
@@ -112,6 +154,22 @@ if [ ! -s "$instance_file" ]; then
     chmod 600 "$instance_file"
 fi
 PI_INSTANCE_ID=$(cat "$instance_file")
+
+# The deployment record is the server's proof that this state dir belongs to
+# this launcher-written deployment (project, instance and snapshot version).
+# The server refuses to start without a matching record, so a bare start of
+# the profile, two instances sharing one state dir, and a snapshot change
+# reusing an old identity are all refused before any job exists. Written
+# atomically; an existing record for a different deployment aborts the launch
+# instead of being overwritten.
+record_tmp="$PI_STATE_DIR/.instance.json.tmp"
+printf '{"contract":1,"project_id":"%s","instance_id":"%s","snapshot_fingerprint":"%s"}\n' \
+    "$PI_PROJECT_ID" "$PI_INSTANCE_ID" "$PI_SNAPSHOT_FINGERPRINT" > "$record_tmp"
+if [ -s "$PI_STATE_DIR/instance.json" ] && ! cmp -s "$record_tmp" "$PI_STATE_DIR/instance.json"; then
+    die "state dir $PI_STATE_DIR holds a deployment record for another project, instance or snapshot; use a fresh state dir for a new deployment"
+fi
+mv "$record_tmp" "$PI_STATE_DIR/instance.json"
+chmod 600 "$PI_STATE_DIR/instance.json"
 
 # The bearer token is generated once and handed only to the server process,
 # which reads it from a file inside the namespace. It never appears in an
@@ -148,7 +206,12 @@ chmod 555 "$stage/bin/agy-mcp"
 # supervisor. It rebuilds agy's environment from a short whitelist (nothing
 # the control plane holds survives), then starts agy inside the inner
 # namespace: shared read-only system files, the read-only snapshot, a private
-# HOME and /tmp, and no control-plane mounts at all.
+# HOME and /tmp, and no control-plane mounts at all. The inner namespace is a
+# PID namespace: from inside it, the control plane's processes do not exist
+# (no /proc handles into their mounts, no signal can address them), and when
+# this bwrap exits (cancel, timeout, or the supervisor dying) the kernel SIGKILLs
+# everything left inside the namespace, including setsid descendants a
+# process-group kill would never reach.
 #
 # Every generated line goes through printf with a single-quoted format, so
 # each trailing double-backslash lands as one literal backslash continuation
@@ -161,6 +224,8 @@ chmod 555 "$stage/bin/agy-mcp"
     printf 'set -eu\n'
     printf 'export HOME=/home/worker\n'
     printf 'export PATH=/usr/local/bin:/usr/bin:/bin\n'
+    printf "export LANG='%s'\n" "$PI_LANG"
+    printf "export TZ='%s'\n" "$PI_TZ"
     if [ -n "$PI_PROXY_URL" ]; then
         printf "export HTTPS_PROXY='%s'\n" "$PI_PROXY_URL"
         printf "export HTTP_PROXY='%s'\n" "$PI_PROXY_URL"
@@ -170,8 +235,12 @@ chmod 555 "$stage/bin/agy-mcp"
     printf '  --ro-bind /usr /usr \\\n'
     printf '  --ro-bind-try /lib /lib \\\n'
     printf '  --ro-bind-try /lib64 /lib64 \\\n'
+    printf '  --ro-bind-try /bin /bin \\\n'
     printf '  --dev /dev \\\n'
+    printf '  --unshare-pid \\\n'
     printf '  --proc /proc \\\n'
+    printf '  --cap-drop ALL \\\n'
+    printf '  --die-with-parent \\\n'
     printf '  --ro-bind-try /etc/ssl /etc/ssl \\\n'
     printf '  --ro-bind-try /etc/resolv.conf /etc/resolv.conf \\\n'
     printf '  --ro-bind-try /etc/hosts /etc/hosts \\\n'
@@ -209,6 +278,13 @@ chmod 555 "$stage/bin/agy-wrapped"
     printf 'set -eu\n'
     printf 'export HOME=/home\n'
     printf 'export PATH=/usr/local/bin:/usr/bin:/bin\n'
+    printf "export LANG='%s'\n" "$PI_LANG"
+    printf "export TZ='%s'\n" "$PI_TZ"
+    printf '# Cold start: the worker path (wrapper, inner namespace, pinned agy) must\n'
+    printf '# answer before the service opens its port. This runs BEFORE any\n'
+    printf '# AGY_MCP_* variable is exported, so the probe proves the worker starts\n'
+    printf '# without ever holding the bearer token in its environment.\n'
+    printf '/stage/bin/agy-wrapped --version >/dev/null\n'
     printf 'export AGY_MCP_PROFILE=pi\n'
     printf "export AGY_MCP_PROJECT_ID='%s'\n" "$PI_PROJECT_ID"
     printf "export AGY_MCP_INSTANCE_ID='%s'\n" "$PI_INSTANCE_ID"
@@ -224,9 +300,6 @@ chmod 555 "$stage/bin/agy-wrapped"
     printf 'export AGY_MCP_REQUIRE_HTTP_TOKEN=true\n'
     printf 'export AGY_MCP_HTTP_TOKEN="$(cat /stage/run-control/token)"\n'
     printf 'export AGY_MCP_AGY_PATH=/stage/bin/agy-wrapped\n'
-    printf '# Cold start: the worker path (wrapper, inner namespace, pinned agy) must\n'
-    printf '# answer before the service opens its port.\n'
-    printf '/stage/bin/agy-wrapped --version >/dev/null\n'
     printf 'exec /stage/bin/agy-mcp -http "%s"\n' "$PI_LISTEN_ADDR"
 } > "$stage/launch.sh"
 chmod 555 "$stage/launch.sh"
@@ -236,6 +309,7 @@ chmod 555 "$stage/launch.sh"
 # ---------------------------------------------------------------------------
 
 exec "$PI_BWRAP" \
+    --clearenv \
     --ro-bind /usr /usr \
     --ro-bind-try /lib /lib \
     --ro-bind-try /lib64 /lib64 \

@@ -297,6 +297,24 @@ Two extra hardening layers are always available:
 agy-mcp -http 127.0.0.1:8765 -http-token "$(openssl rand -hex 32)"
 ```
 
+Child processes never see this server's own configuration variables (including the bearer token): every spawn site (the `run-job` supervisor, the agy worker, and every probe) filters `AGY_MCP_*` out of the inherited environment, because agy's workspace hooks run with the worker's environment and must not be able to read the control plane's secrets.
+
+### Protected profile (`AGY_MCP_PROFILE=pi`)
+
+The `pi` profile selects a protected deployment for delegating work from a sandboxed agent (such as a Pi session) to the host's agy. It is fail closed at startup: an unknown profile value, a missing or conflicting setting, or a state directory this instance does not own refuses the start rather than degrading into a half-protected server.
+
+Required settings under the profile:
+
+- `AGY_MCP_ALLOWED_ROOTS`: exactly one absolute directory, the single project snapshot the instance serves (one instance serves one project; more projects means more instances, each with its own identity, state dir and token).
+- `AGY_MCP_DEFAULT_CWD`: the working directory used when a caller omits `cwd`; it must be the allowed root itself.
+- `AGY_MCP_STATE_DIR`: this instance's own job-state directory, never the default or a shared one. At startup the instance scans the store and refuses to serve if it holds jobs it did not create (each protected job carries an `ownership.json` record naming the deployment-assigned project and instance).
+- `AGY_MCP_MAX_TIMEOUT`: the per-job timeout budget (for example `20m`); a server default above it is lowered to match, so runs that omit `timeout` still work.
+- `AGY_MCP_INSTANCE_ID` / `AGY_MCP_PROJECT_ID`: deployment-assigned identities, set by the launcher, never by a tool call.
+
+Fixed by the profile (an explicit conflicting value is refused): `--sandbox` is forced on every run, `--dangerously-skip-permissions` stays on, `json_schema` is refused (agy treats an unparseable value as a file path and reads it, MEASURED against agy 1.5.17), `continue_latest` and `list_sessions` are refused, no conversation id is ever returned to or accepted from a caller, and HTTP mode with a bearer token is mandatory (stdio is refused).
+
+What the profile does not do: parameter checks and `--sandbox` are not a filesystem boundary. agy's built-in file tools, its workspace hooks, and even its terminal sandbox reach outside the working directory (MEASURED against agy 1.5.17), so the hard isolation is the deployment's OS layer (a bubblewrap launcher and a dedicated service identity, see `deploy/`), verified there, not by this profile. `agy-mcp doctor` reports the policy separately from the configuration and repeats this boundary note.
+
 ## Upgrading from v2.1
 
 **Behaviour change to check your client against:** `list_models` used to return each `agy models` row whole in `models`, as a tab-joined `id<TAB>label` string. It now returns the id alone, and pairs each id with its display label in the new `model_details` field. No type on the wire changed, only the values, so a client that renders `models` to a human now shows a slug and should read `model_details[].label` instead, and one that split each entry on the tab will find nothing to split. A stored old value passed back as `model` still works: the server reduces a whole row to its id before running it.
@@ -327,6 +345,22 @@ v2 requires agy 1.1.15 and drives it through `--output-format stream-json`. The 
 | `AGY_MCP_USAGE_LOW` | `25` | remaining quota percent (`25` or `25%`) below which a group reports `low`; a bad value, or `AGY_MCP_USAGE_CRITICAL` above it, fails startup |
 | `AGY_MCP_USAGE_CRITICAL` | `5` | remaining quota percent below which a group reports `critical` |
 | `AGY_MCP_WAIT_READY_FILE` | (none) | absolute path `wait-job` / `hook-wait` create once their SIGINT/SIGTERM handler is installed, so a parent can signal without racing it; must be fresh per invocation, an existing file is refused rather than overwritten; empty = nothing is written |
+| `AGY_MCP_PROFILE` | (unset) | `pi` selects the protected single-project profile (see its section under HTTP mode); any other non-empty value fails startup |
+| `AGY_MCP_ALLOWED_ROOTS` | (unset, no path checks) | list-separator-separated absolute directories every `cwd` and `dirs` entry must resolve under; with this set, an omitted `cwd` resolves to `AGY_MCP_DEFAULT_CWD` or is refused, relative paths are refused, symlinks are resolved before containment is judged, and `list_agents` applies the same rule to its `cwd` |
+| `AGY_MCP_DEFAULT_CWD` | (unset) | canonical directory used when a caller omits `cwd` (restricted mode only); must be inside `AGY_MCP_ALLOWED_ROOTS` |
+| `AGY_MCP_FORCE_SANDBOX` | `false` | pass `--sandbox` to agy on every run regardless of the caller's `sandbox`; defense in depth only, not a filesystem boundary |
+| `AGY_MCP_DISABLE_SKIP_PERMISSIONS` | `false` | stop passing `--dangerously-skip-permissions`; MEASURED against agy 1.5.17, runs then land in request-review mode where compound shell commands are refused as `denied_actions`, but built-in file tools still reach outside cwd, so this does not make a run read-only |
+| `AGY_MCP_INLINE_JSON_SCHEMA_ONLY` | `false` | restrict `json_schema` to an inline JSON object of at most 64 KiB, refusing file paths and non-object JSON |
+| `AGY_MCP_SESSION_POLICY` | `allow` | `disabled` refuses `list_sessions`, `continue_latest` and any `conversation_id`, and strips conversation ids from status responses; `managed-only` is reserved for the Phase 3 protected session index and behaves like `disabled` until that exists |
+| `AGY_MCP_DISABLE_CONTINUE_LATEST` | `false` | refuse `continue_latest=true` while still accepting explicit `conversation_id` values |
+| `AGY_MCP_DISABLE_AGENT_SELECTION` | `false` | refuse a non-empty `agent` and make `list_agents` return an empty list without executing agy |
+| `AGY_MCP_ALLOWED_AGENTS` | (unset, no filter) | comma-separated agent-name whitelist; `list_agents` filters its listing and `agy_run` refuses unlisted names |
+| `AGY_MCP_ALLOWED_MODELS` | (unset, no filter) | comma-separated model-id whitelist; `list_models` filters its listing, an omitted model with no server default is refused, and `doctor` warns when the whitelist matches nothing agy lists |
+| `AGY_MCP_MAX_TIMEOUT` | (unset, upstream 24h) | cap on a caller-supplied per-job timeout (a Go duration, `0 < d <= 24h`); a server default above it is lowered to match so runs omitting `timeout` keep working |
+| `AGY_MCP_MAX_CONCURRENCY` | `4` | cap on concurrent jobs for this instance (a positive integer); invalid values fail startup |
+| `AGY_MCP_REQUIRE_HTTP_TOKEN` | `false` | refuse an HTTP start whose final token is empty (covering both an unset `AGY_MCP_HTTP_TOKEN` and an explicit `-http-token ""`) |
+| `AGY_MCP_INSTANCE_ID` | (unset) | deployment-assigned instance identity, stamped into each job's ownership record under the `pi` profile |
+| `AGY_MCP_PROJECT_ID` | (unset) | deployment-assigned project identity, matched the same way |
 
 ## Development
 

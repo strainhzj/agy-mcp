@@ -154,12 +154,14 @@ directory is a template, not a proven boundary.
 
 ## Upgrading and redeploying
 
-- **Snapshot content changed:** re-run the launcher. The new fingerprint
-  becomes the deployment's snapshot version; jobs and idempotency keys from
-  the previous version are refused (a caller retries with the same key and
-  gets a fresh run), which is the contract: new content is a new deployment.
-  If you intend the old jobs to stay queryable, give the new deployment a
-  fresh state dir instead of re-pointing the old one.
+- **Snapshot content changed:** re-run the launcher against a FRESH state
+  dir (move the old one aside). The launcher refuses to re-point a state dir
+  whose deployment record names another snapshot, so new content is a new
+  deployment: new fingerprint, new instance record, and jobs and
+  idempotency keys from the previous version are not carried over (a caller
+  retrying an old key gets a fresh run). Old completed results stay
+  queryable in the retired state dir only by hand, never through the new
+  instance.
 - **State dir from an earlier build:** a state dir without `instance.json`,
   or with jobs whose ownership records predate fingerprints, is refused at
   startup by design. Move it aside and start the instance on a fresh state

@@ -27,3 +27,6 @@ go.work.sum
 .serena/
 .sentrux/
 .codegraph/
+
+# Local deployment runtime state (never committed)
+/run/

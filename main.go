@@ -16,6 +16,7 @@ import (
 	"github.com/tphakala/agy-mcp/v2/internal/config"
 	"github.com/tphakala/agy-mcp/v2/internal/manager"
 	"github.com/tphakala/agy-mcp/v2/internal/mcptools"
+	"github.com/tphakala/agy-mcp/v2/internal/policy"
 	"github.com/tphakala/agy-mcp/v2/internal/supervisor"
 )
 
@@ -83,6 +84,14 @@ func serve() error {
 			cfg.HTTPToken = *httpToken
 		}
 	})
+	// The bind address and the final token are validated BEFORE the manager
+	// exists, before job recovery runs, and before any background probe starts
+	// (the plan's startup-order requirement): a server that would refuse these
+	// must not spend its startup window restoring jobs or probing agy. See
+	// validateServeStartup for what is checked and why.
+	if err := validateServeStartup(cfg, *httpAddr); err != nil {
+		return err
+	}
 	if cfg.AgyPath == "" {
 		// Resolve deferred the lookup rather than refusing to start, so say once what
 		// that means. Without this the server looks healthy and every run fails, which
@@ -116,9 +125,9 @@ func serve() error {
 	go mgr.RunUsageRefresherFromConfig(ctx)
 
 	if *httpAddr != "" {
-		if err := checkLoopbackAddr(*httpAddr); err != nil {
-			return err
-		}
+		// The bind address was already validated above (loopback only, and a
+		// token present whenever the policy demands one); nothing re-checks it
+		// here.
 		authNote := "unauthenticated"
 		if cfg.HTTPToken != "" {
 			authNote = "bearer-token auth enabled"
@@ -133,6 +142,39 @@ func serve() error {
 	log.Print("serving over stdio")
 	if err := mcptools.ServeStdio(ctx, mgr); err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("stdio serve: %w", err)
+	}
+	return nil
+}
+
+// validateServeStartup checks the HTTP-facing startup contract before the
+// manager is constructed, job recovery runs, or any background probe starts:
+//
+//   - an HTTP bind address must be loopback (the same check as before, just
+//     earlier), because the bearer token is optional upstream;
+//   - RequireHTTPToken (AGY_MCP_REQUIRE_HTTP_TOKEN) makes an empty final token
+//     a startup refusal, so an unauthenticated HTTP server cannot come up by
+//     omission or by an explicit -http-token "" override;
+//   - a protected profile is HTTP-only and always token-bearing: stdio has no
+//     transport boundary at all (any local process can speak it), which is
+//     exactly the access path the profile exists to close. The profile already
+//     forced RequireHTTPToken at Resolve; this states the stdio refusal and
+//     names the missing -http flag.
+//
+// stdio mode without a protected profile keeps upstream behavior: no token is
+// required, because stdio has no HTTP surface for RequireHTTPToken to guard.
+func validateServeStartup(cfg config.Config, httpAddr string) error {
+	protected := cfg.Policy.Protected()
+	if httpAddr == "" {
+		if protected {
+			return fmt.Errorf("profile %s serves Streamable HTTP only: pass -http 127.0.0.1:<port> (stdio mode has no transport boundary and is refused under the profile)", policy.ProfilePi)
+		}
+		return nil
+	}
+	if err := checkLoopbackAddr(httpAddr); err != nil {
+		return err
+	}
+	if cfg.Policy.RequireHTTPToken && cfg.HTTPToken == "" {
+		return fmt.Errorf("%s is set (or profile %s is active): set AGY_MCP_HTTP_TOKEN or pass -http-token <token>; an empty token cannot start", config.EnvRequireHTTPToken, policy.ProfilePi)
 	}
 	return nil
 }

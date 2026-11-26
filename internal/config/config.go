@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"github.com/tphakala/agy-mcp/v2/internal/policy"
 	"math"
 	"os"
 	"os/exec"
@@ -75,6 +76,17 @@ type Config struct {
 	// which a group reports the low and critical levels (see manager.QuotaLevel).
 	QuotaLow      float64
 	QuotaCritical float64
+
+	// Policy is the resolved deployment policy (see internal/policy and
+	// policy.go in this package). The zero value keeps upstream behavior.
+	Policy policy.Policy
+	// ProjectID and InstanceID are deployment-assigned identities (AGY_MCP_PROJECT_ID,
+	// AGY_MCP_INSTANCE_ID). They are empty unless a protected deployment set
+	// them, and they never come from a tool call: a protected instance stamps
+	// them into each job's ownership record and refuses jobs whose record does
+	// not match.
+	ProjectID  string
+	InstanceID string
 }
 
 // baseConfig returns a Config carrying exactly the defaults shared by Resolve
@@ -102,6 +114,13 @@ func Resolve() (Config, error) {
 	c := baseConfig()
 	c.DefaultModel = os.Getenv(EnvDefaultModel)
 	c.HTTPToken = os.Getenv(EnvHTTPToken)
+	// The deployment policy fails closed: an unusable root, an unknown profile
+	// value, or a conflicting pi-profile setting refuses the start here, before
+	// any job can run under a half-protected server. See policy.go in this
+	// package for the variables and the profile requirements.
+	if err := resolvePolicy(&c); err != nil {
+		return Config{}, err
+	}
 
 	// The two lookup branches fail differently, on purpose.
 	//
@@ -153,6 +172,13 @@ func Resolve() (Config, error) {
 		return Config{}, err
 	}
 	c.StateDir = stateRoot
+
+	// The concurrency override and the default-timeout downshift run last: the
+	// downshift needs the validated MaxTimeout, and both need the base defaults
+	// already in place. See finishPolicy in policy.go.
+	if err := finishPolicy(&c); err != nil {
+		return Config{}, err
+	}
 
 	return c, nil
 }

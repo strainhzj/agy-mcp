@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tphakala/agy-mcp/v2/internal/config"
 	"github.com/tphakala/agy-mcp/v2/internal/manager"
 )
 
@@ -131,9 +132,9 @@ func TestParseWaitCeiling(t *testing.T) {
 	// see the built-in ceiling; maxSyncWait treats "" as unset. The parent is
 	// non-parallel, so a parent-level t.Setenv is safe and the per-subtest overrides
 	// still win and restore back to "" on cleanup.
-	t.Setenv(envSyncWaitCap, "")
-	if syncWaitCeiling >= 120*time.Second {
-		t.Fatalf("syncWaitCeiling = %v, want it safely below the ~120s MCP client per-call cap", syncWaitCeiling)
+	t.Setenv(config.EnvSyncWaitCap, "")
+	if config.DefaultSyncWaitCap >= 120*time.Second {
+		t.Fatalf("DefaultSyncWaitCap = %v, want it safely below the ~120s MCP client per-call cap", config.DefaultSyncWaitCap)
 	}
 
 	t.Run("default is the ceiling", func(t *testing.T) {
@@ -141,8 +142,8 @@ func TestParseWaitCeiling(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got != syncWaitCeiling {
-			t.Fatalf("default wait = %v, want the ceiling %v", got, syncWaitCeiling)
+		if got != config.DefaultSyncWaitCap {
+			t.Fatalf("default wait = %v, want the ceiling %v", got, config.DefaultSyncWaitCap)
 		}
 	})
 	t.Run("over-ceiling clamps to the ceiling", func(t *testing.T) {
@@ -150,8 +151,8 @@ func TestParseWaitCeiling(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got != syncWaitCeiling {
-			t.Fatalf("clamped wait = %v, want the ceiling %v", got, syncWaitCeiling)
+		if got != config.DefaultSyncWaitCap {
+			t.Fatalf("clamped wait = %v, want the ceiling %v", got, config.DefaultSyncWaitCap)
 		}
 	})
 	t.Run("under-ceiling passes through unchanged", func(t *testing.T) {
@@ -164,7 +165,7 @@ func TestParseWaitCeiling(t *testing.T) {
 		}
 	})
 	t.Run("env override raises the cap", func(t *testing.T) {
-		t.Setenv(envSyncWaitCap, "3m")
+		t.Setenv(config.EnvSyncWaitCap, "3m")
 		def, err := parseWait("")
 		if err != nil {
 			t.Fatal(err)
@@ -183,7 +184,7 @@ func TestParseWaitCeiling(t *testing.T) {
 		}
 	})
 	t.Run("env override lowers the cap", func(t *testing.T) {
-		t.Setenv(envSyncWaitCap, "30s")
+		t.Setenv(config.EnvSyncWaitCap, "30s")
 		def, err := parseWait("")
 		if err != nil {
 			t.Fatal(err)
@@ -202,13 +203,13 @@ func TestParseWaitCeiling(t *testing.T) {
 	})
 	t.Run("invalid override is ignored", func(t *testing.T) {
 		for _, bad := range []string{"nonsense", "0s", "-1s"} {
-			t.Setenv(envSyncWaitCap, bad)
+			t.Setenv(config.EnvSyncWaitCap, bad)
 			got, err := parseWait("")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != syncWaitCeiling {
-				t.Fatalf("override %q: default = %v, want the built-in ceiling %v", bad, got, syncWaitCeiling)
+			if got != config.DefaultSyncWaitCap {
+				t.Fatalf("override %q: default = %v, want the built-in ceiling %v", bad, got, config.DefaultSyncWaitCap)
 			}
 		}
 	})

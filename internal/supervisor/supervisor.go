@@ -270,6 +270,21 @@ func run(jobDir string, grace, drainWait time.Duration) error {
 	}
 	defer func() { _ = devnull.Close() }()
 
+	// A job with an ownership record is a protected job: the manager writes
+	// that record only under a protected profile (see internal/manager/policy.go).
+	// Two extra controls hang off it, both control-plane protections the
+	// supervisor applies locally so the invariant does not depend on the
+	// manager's runtime state: the worker environment is reduced to the strict
+	// allowlist, and the captured output is capped so a stuck or flooding
+	// worker cannot fill the control plane's disk.
+	var outW, errW io.Writer = outF, errF
+	_, ownershipErr := os.Stat(jobstore.OwnershipPath(jobDir))
+	protectedJob := ownershipErr == nil
+	if protectedJob {
+		outW = &cappedWriter{w: outF, remaining: protectedOutputCap}
+		errW = &cappedWriter{w: errF, remaining: protectedOutputCap}
+	}
+
 	// Resolve the args once and reuse them, so the marker below is decided from
 	// exactly what agy is being run with rather than from a second guess at it.
 	args := ensureStreamJSON(m.Args)
@@ -279,10 +294,15 @@ func run(jobDir string, grace, drainWait time.Duration) error {
 	// above all) before agy, its tools, its hooks and its MCP plugins see the
 	// environment. The manager already sanitized what it handed this process;
 	// filtering again keeps the invariant local to the spawner instead of
-	// trusting every future caller to remember it.
+	// trusting every future caller to remember it. A protected job goes one
+	// step further: the environment is the strict allowlist, so nothing the
+	// control plane holds beyond HOME/PATH/locale/proxy reaches the worker.
 	cmd.Env = config.SanitizeEnv(os.Environ()) // agy needs HOME/PATH and its OAuth/API credentials
+	if protectedJob {
+		cmd.Env = config.SanitizeEnvStrict(os.Environ())
+	}
 	cmd.Stdin = devnull
-	cmd.Stderr = errF
+	cmd.Stderr = errW
 	// agy runs with --output-format stream-json, so stdout is an event stream to
 	// decode rather than text to copy. Reading it is what makes the conversation
 	// id observable while the run is still going (the init event carries it) and
@@ -308,7 +328,7 @@ func run(jobDir string, grace, drainWait time.Duration) error {
 	proc.ConfigureSession(cmd)
 
 	if selectsStreamJSON(args) {
-		markStreamJSON(jobDir, errF)
+		markStreamJSON(jobDir, errW)
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -385,7 +405,7 @@ func run(jobDir string, grace, drainWait time.Duration) error {
 	// job reported as running for good. Draining concurrently keeps Wait, the hard
 	// timeout and the sentinel on a path no descendant can block.
 	drained := make(chan streamOutcome, 1)
-	go func() { drained <- consumeStream(jobDir, pr, outF) }()
+	go func() { drained <- consumeStream(jobDir, pr, outW) }()
 
 	waitErr := cmd.Wait()
 	close(done)
@@ -408,7 +428,7 @@ func run(jobDir string, grace, drainWait time.Duration) error {
 	// Record what the stream reported, before the exit-code sentinel: the
 	// manager treats the sentinel as the completion signal, so anything written
 	// after it could be missed by a poller that observes the sentinel first.
-	outcome.persist(jobDir, errF)
+	outcome.persist(jobDir, errW)
 
 	code := 0
 	if waitErr != nil {

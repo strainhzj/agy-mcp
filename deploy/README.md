@@ -23,7 +23,10 @@ instance with its own identity, state dir, token and endpoint, never a wider
   `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config`, `~/.pi`) are not bound
   anywhere. The worker (agy and everything it spawns, hooks included) sees
   less: the snapshot, minimal system files, a private HOME and /tmp, and no
-  control-plane mounts. The worker's namespace is also a PID namespace: from
+  control-plane mounts. Its agy sign-in state arrives as a FRESH COPY of the
+  read-only staged identity on a size-limited tmpfs (per job), so the worker
+  holds no writable host mount at all and a stuck job cannot fill the disk
+  through its config. The worker's namespace is also a PID namespace: from
   inside it the control plane's processes do not exist, so no `/proc/<pid>/root`
   handle reaches the token or the job store, no signal can address the
   control plane, and when the worker's bwrap exits (cancel, timeout, or the
@@ -65,20 +68,32 @@ instance with its own identity, state dir, token and endpoint, never a wider
   access to the snapshot). The control plane is deliberately not root: a
   worker that escaped its namespaces would otherwise read the token and the
   job store straight off the disk.
-- **Kernel-enforced egress.** `IPAddressDeny=any` plus `IPAddressAllow`
-  lines are the network boundary for the whole instance cgroup, worker
-  included; proxy environment variables are agy configuration, not
-  enforcement (a hook can drop them). Allow loopback (the host-side bridge
-  needs it to reach the endpoint) plus your egress proxy and any direct
-  model endpoints; out of the box the instance has no external egress at
-  all, and a job that needs the model fails fast until you allow its route.
-  Requires a systemd with cgroup BPF support; without it the unit fails to
-  start rather than serving unfiltered. DNS is not covered by default: use
+- **Kernel-enforced egress.** `IPAddressDeny=any` plus the per-instance
+  drop-in's `IPAddressAllow` lines are the network boundary for the whole
+  instance cgroup, worker included; proxy environment variables are agy
+  configuration, not enforcement (a hook can drop them). The drop-in allows
+  the instance's own dedicated loopback address (the one `PI_LISTEN_ADDR`
+  names, e.g. `127.0.0.8/32`; each instance gets its own so a worker cannot
+  reach another instance's endpoint), plus the egress proxy and any direct
+  model endpoints. Every OTHER host loopback service is denied to the
+  worker. The template allows nothing: an instance without its drop-in
+  cannot even accept the bridge's connection, which is the fail-closed
+  shape. Requires a systemd with cgroup BPF support; on a host where that is
+  missing the settings can be silently ineffective (the unit still starts),
+  which is exactly what the egress negative controls below detect: if a
+  probe to an unrelated destination SUCCEEDS, the filter is not effective
+  and the endpoint must not be exposed. DNS is not covered by default: use
   IP literals for the proxy.
 - **Resource limits.** Memory, task, process and CPU caps apply to the whole
-  instance tree. The supervisor additionally caps each protected job's
-  captured output (out and err) at 64 MiB per stream, so a stuck or flooding
-  worker cannot fill the control plane's disk.
+  instance tree. Three disk and load bounds live in the server itself: the
+  supervisor caps each protected job's captured output (out and err) at
+  64 MiB per stream, the instance's job store carries a disk budget
+  (`AGY_MCP_STATE_BUDGET`, default 2 GiB under the profile) whose GC pass
+  evicts the oldest removable terminal jobs when the store outgrows it, and
+  the HTTP endpoint is bounded by an idle-session timeout, a session count,
+  an in-flight cap and a request rate (profile defaults; no operator
+  opt-in). The worker's only persistent writable host path is gone: its agy
+  config lives on the per-job size-limited tmpfs.
 
 ## What this deployment does not prove
 
@@ -121,7 +136,19 @@ directory is a template, not a proven boundary.
 
        systemctl enable --now agy-mcp-pi@pi-review
 
-5. Read the token for the client config:
+5. Write the egress drop-in for THIS instance (the unit denies everything
+   until it exists):
+
+       /etc/systemd/system/agy-mcp-pi@pi-review.service.d/egress.conf
+       [Service]
+       IPAddressAllow=127.0.0.8/32
+       IPAddressAllow=192.168.5.60/32      # the egress proxy, IP literal
+       # plus any direct model endpoints agy talks to
+
+   The first line MUST equal the address in `PI_LISTEN_ADDR` (dedicated per
+   instance, never the shared 127.0.0.1). Then restart the unit.
+
+6. Read the token for the client config:
 
        cat /var/lib/agy-mcp/pi-review/control/token
 
@@ -155,8 +182,13 @@ directory is a template, not a proven boundary.
 - [ ] **Egress**: with the unit's allowlist applied, the worker reaches the
       allowed proxy/model destinations (positive control) and a probe to an
       unrelated destination fails by direct connection, through the proxy,
-      and on both IPv4 and IPv6 (negative controls). Also verify a hook that
-      unsets the proxy variables gets no new reach.
+      and on both IPv4 and IPv6 (negative controls). The negative-control
+      list MUST include host loopback destinations other than this
+      instance's own endpoint (for example 127.0.0.1:6379 and [::1]:22):
+      this is what proves the dedicated-address isolation, and it doubles as
+      the cgroup-BPF check. If ANY negative control succeeds, the filter is
+      not effective on this host: do not expose the endpoint. Also verify a
+      hook that unsets the proxy variables gets no new reach.
 - [ ] **Normal calls**: the sandboxed client discovers the endpoint and gets a
       read-only analysis from `agy_run_sync`; a follow-up request restates the
       needed context and succeeds; an explicit `conversation_id` or
@@ -169,21 +201,34 @@ directory is a template, not a proven boundary.
 - [ ] **Resources and recovery**: the concurrency cap holds; timeout and
       cancel reclaim the worker tree including a setsid descendant (the PID
       namespace makes this structural; verify it anyway); the output cap
-      holds against a flooding fake worker; restarting the service reaps
+      holds against a flooding fake worker; a flood WRITE into the worker's
+      agy config path fails once the tmpfs size bound is hit and the host
+      disk does not grow; the state disk budget evicts the oldest terminal
+      jobs when padded past it and never a running one; the HTTP guards
+      reject excess sessions, in-flight requests and over-rate requests
+      (429/503) while normal calls pass; restarting the service reaps
       unfinished workers and never reports an unfinished job as done
       (interrupted jobs report failed/interrupted, with the partial text
       kept); a snapshot content change under the same state dir refuses
       replays of the previous version's jobs.
+- [ ] **Service identity across jobs**: run two consecutive jobs and confirm
+      the second still authenticates (the per-job seeded tmpfs discards
+      token refreshes; if your provider rotates refresh tokens between jobs,
+      re-provision the service identity and record that in the runbook).
 
 ## Publishing the endpoint to a sandboxed client
 
-The server binds loopback inside the namespace. When the client runs in its
-own network namespace (a sandboxed Pi session), bridge exactly this endpoint
-and nothing else, for example with socat on the host:
+The server binds the instance's dedicated loopback address inside the
+namespace (PI_LISTEN_ADDR, for example 127.0.0.8:8765). When the client runs
+in its own network namespace (a sandboxed Pi session), bridge exactly this
+endpoint and nothing else, for example with socat on a host that can reach
+the server:
 
     socat TCP-LISTEN:8765,bind=<client-facing-ip>,fork,reuseaddr \
-      PROXY:<control-plane-host>,proxyport=3128,proxyauth=...
+      TCP:127.0.0.8:8765
 
+(If the bridge host reaches the server only through the egress proxy, front
+that hop in the network policy rather than widening the instance allowlist.)
 Rules: the bridge must not bypass bearer auth (it cannot: it forwards the
 stream, and the server rejects unauthenticated calls), must not log the
 `Authorization` header, and the client-side allowlist gets exactly this

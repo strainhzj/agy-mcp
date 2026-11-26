@@ -54,7 +54,13 @@ esac
 : "${PI_SNAPSHOT_DIR:?set PI_SNAPSHOT_DIR (the host directory the read-only snapshot is served from)}"
 : "${PI_STATE_DIR:?set PI_STATE_DIR (this instance's private job-state directory)}"
 : "${PI_CONTROL_DIR:?set PI_CONTROL_DIR (the launcher's private control-plane directory)}"
-: "${PI_LISTEN_ADDR:=127.0.0.1:8765}"
+# The default is this instance's DEDICATED loopback address: the loopback /8
+# is per-instance address space, and the unit's egress drop-in admits exactly
+# this one address, so a worker that dials any other host loopback service is
+# denied by the kernel. The shared 127.0.0.1 cannot give that guarantee (on
+# it the allowlist cannot tell this endpoint from every other host service),
+# which is why it is refused below.
+: "${PI_LISTEN_ADDR:=127.0.0.8:8765}"
 PI_AGY_BIN="${PI_AGY_BIN:-$(command -v agy || true)}"
 PI_BWRAP="${PI_BWRAP:-$(command -v bwrap || true)}"
 PI_AGY_MCP_BIN="${PI_AGY_MCP_BIN:-$(command -v agy-mcp || true)}"
@@ -63,6 +69,9 @@ PI_PROXY_URL="${PI_PROXY_URL:-}"
 PI_MAX_TIMEOUT="${PI_MAX_TIMEOUT:-20m}"
 PI_MAX_CONCURRENCY="${PI_MAX_CONCURRENCY:-2}"
 PI_SYNC_WAIT_CAP="${PI_SYNC_WAIT_CAP:-50s}"
+PI_SESSION_POLICY="${PI_SESSION_POLICY:-disabled}"
+PI_SESSION_TTL="${PI_SESSION_TTL:-168h}"
+PI_GEMINI_TMPFS_SIZE="${PI_GEMINI_TMPFS_SIZE:-256MiB}"
 
 # Locale and timezone are baked into the generated scripts, so their values
 # must be ones a single-quoted shell string can carry safely; anything odd
@@ -106,8 +115,14 @@ die() {
 [ -d "$PI_SNAPSHOT_DIR" ] || die "snapshot dir $PI_SNAPSHOT_DIR does not exist"
 PI_SNAPSHOT_DIR=$(cd "$PI_SNAPSHOT_DIR" && pwd -P)
 case "$PI_LISTEN_ADDR" in
-    127.0.0.1:*|localhost:*|\[::1\]:*) ;;
-    *) die "PI_LISTEN_ADDR must be loopback; publish the endpoint with a dedicated bridge instead" ;;
+    127.0.0.1:*|localhost:*)
+        die "PI_LISTEN_ADDR must name this instance's dedicated loopback address (for example 127.0.0.8:8765), never the shared 127.0.0.1 or localhost: the unit's egress allowlist can only isolate a dedicated address, and on a shared one the worker could reach every other host loopback service" ;;
+    127.*:*) ;;
+    *) die "PI_LISTEN_ADDR must be a loopback 127.x.x.x address; publish the endpoint with a dedicated bridge instead" ;;
+esac
+case "$PI_SESSION_POLICY" in
+    disabled|managed-only) ;;
+    *) die "PI_SESSION_POLICY must be disabled or managed-only" ;;
 esac
 if [ -n "$PI_AGY_CONFIG_DIR" ]; then
     [ -d "$PI_AGY_CONFIG_DIR" ] || die "PI_AGY_CONFIG_DIR $PI_AGY_CONFIG_DIR does not exist"
@@ -132,9 +147,34 @@ PI_SNAPSHOT_FINGERPRINT=$(cd "$PI_SNAPSHOT_DIR" && find . -xdev \( -type f -o -t
 
 # Nested namespaces: the worker view nests bwrap. MEASURED against this
 # host's bwrap build: nesting starts and one masked directory stays masked
-# (Phase 0 T5); refuse early if this build cannot nest at all.
+# (Phase 0 T5); refuse early if this build cannot nest at all. The worker's
+# .gemini tmpfs is bounded with --size, so this build must also know that
+# option: a tmpfs without a size limit is only as bounded as the unit's
+# memory cap, and the disk-bound guarantee wants the kernel-enforced one.
 "$PI_BWRAP" --ro-bind / / /bin/true >/dev/null 2>&1 \
     || die "nested bubblewrap test failed; this build cannot host the two-level isolation"
+"$PI_BWRAP" --help 2>&1 | grep -q -- '--size' \
+    || die "this bubblewrap has no --size option; the worker's .gemini tmpfs cannot be bounded"
+
+# gemini_size_bytes converts 256MiB-style suffixes (case-insensitive) or a
+# bare byte count to bytes, so PI_GEMINI_TMPFS_SIZE reads like a size.
+gemini_size_bytes() {
+    v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$v" in
+        *kib) mul=1024; v=${v%kib} ;;
+        *mib) mul=1048576; v=${v%mib} ;;
+        *gib) mul=1073741824; v=${v%gib} ;;
+        *tib) mul=1099511627776; v=${v%tib} ;;
+        *b) mul=1; v=${v%b} ;;
+        *) mul=1 ;;
+    esac
+    case "$v" in ''|*[!0-9]*) return 1 ;;
+    esac
+    echo $((v * mul))
+}
+PI_GEMINI_TMPFS_BYTES=$(gemini_size_bytes "$PI_GEMINI_TMPFS_SIZE") \
+    || die "PI_GEMINI_TMPFS_SIZE must be like 256MiB or a plain byte count"
+[ "$PI_GEMINI_TMPFS_BYTES" -gt 0 ] || die "PI_GEMINI_TMPFS_SIZE must be positive"
 
 mkdir -p "$PI_CONTROL_DIR" "$PI_STATE_DIR"
 chmod 700 "$PI_CONTROL_DIR" "$PI_STATE_DIR"
@@ -250,20 +290,35 @@ chmod 555 "$stage/bin/agy-mcp"
     printf '  --tmpfs /home/worker \\\n'
     printf '  --ro-bind /workspace /workspace \\\n'
     if [ -n "$PI_AGY_CONFIG_DIR" ]; then
-        # The service identity is the worker's own, mounted rw into its
-        # private view: agy needs to record fresh-run session state there.
-        # It is not the operator's personal config and it never appears in
-        # the control plane's view.
-        printf '  --bind /worker-gemini /home/worker/.gemini \\\n'
+        # The service identity is the worker's own, but it never arrives as a
+        # writable host mount: /seed is the READ-ONLY staged copy (bound by
+        # the outer namespace), and each job starts with a fresh copy of it
+        # on a size-limited tmpfs (the seed line below runs inside the
+        # namespace before agy). A stuck or malicious job therefore cannot
+        # fill the host disk through its agy config, and no job's writes
+        # (token refreshes included) survive into the next job; re-provision
+        # the service identity if a provider rotates refresh tokens between
+        # jobs (see README.md).
+        printf '  --ro-bind-try /seed /seed \\\n'
+        printf '  --size %s --tmpfs /home/worker/.gemini \\\n' "$PI_GEMINI_TMPFS_BYTES"
     else
         # No service identity provisioned: agy starts unconfigured, and the
         # cold-start check in the entrypoint refuses the service when agy
-        # cannot answer in that state.
-        printf '  --tmpfs /home/worker/.gemini \\\n'
+        # cannot answer in that state. The tmpfs is still size-bounded: an
+        # unconfigured agy must not become the one unbounded writable path.
+        printf '  --size %s --tmpfs /home/worker/.gemini \\\n' "$PI_GEMINI_TMPFS_BYTES"
     fi
     printf '  --ro-bind /stage/bin/agy-real /agy/agy \\\n'
     printf '  -- \\\n'
-    printf '  /agy/agy "$@"\n'
+    if [ -n "$PI_AGY_CONFIG_DIR" ]; then
+        # Seed the fresh .gemini from the read-only staged copy, then exec
+        # agy with the wrapper's own arguments. The cp is best effort: a
+        # missing /seed leaves an empty .gemini, which the cold-start check
+        # would already have refused the service over.
+        printf '  /bin/sh -c '\''cp -a /seed/. /home/worker/.gemini/ 2>/dev/null || true; exec /agy/agy "$@"'\'' agy "$@"\n'
+    else
+        printf '  /agy/agy "$@"\n'
+    fi
 } > "$stage/bin/agy-wrapped"
 chmod 555 "$stage/bin/agy-wrapped"
 
@@ -292,7 +347,10 @@ chmod 555 "$stage/bin/agy-wrapped"
     printf 'export AGY_MCP_ALLOWED_ROOTS=/workspace\n'
     printf 'export AGY_MCP_DEFAULT_CWD=/workspace\n'
     printf 'export AGY_MCP_FORCE_SANDBOX=true\n'
-    printf 'export AGY_MCP_SESSION_POLICY=disabled\n'
+    printf "export AGY_MCP_SESSION_POLICY='%s'\n" "$PI_SESSION_POLICY"
+    if [ "$PI_SESSION_POLICY" = managed-only ]; then
+        printf "export AGY_MCP_SESSION_TTL='%s'\n" "$PI_SESSION_TTL"
+    fi
     printf 'export AGY_MCP_DISABLE_CONTINUE_LATEST=true\n'
     printf "export AGY_MCP_MAX_TIMEOUT='%s'\n" "$PI_MAX_TIMEOUT"
     printf "export AGY_MCP_MAX_CONCURRENCY='%s'\n" "$PI_MAX_CONCURRENCY"
@@ -327,7 +385,7 @@ exec "$PI_BWRAP" \
     --ro-bind "$PI_SNAPSHOT_DIR" /workspace \
     --bind "$PI_STATE_DIR" /state \
     --ro-bind "$stage" /stage \
-    --bind-try "$PI_CONTROL_DIR/gemini" /worker-gemini \
+    --ro-bind-try "$PI_CONTROL_DIR/gemini" /seed \
     --die-with-parent \
     --new-session \
     -- \

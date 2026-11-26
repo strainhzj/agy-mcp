@@ -52,19 +52,29 @@ CPUQuota=200%
 # Controlled egress: the allowlist below is the enforced network boundary for
 # everything in this cgroup (worker included), applied by the kernel's cgroup
 # BPF, not by environment variables a hook could drop. Deny everything, then
-# allow exactly what the instance needs:
-#   - loopback, so the host-side bridge can reach the server's 127.0.0.1
-#     endpoint and internal IPC keeps working;
-#   - the egress proxy that carries agy's model traffic (add one line per
-#     proxy address, e.g. IPAddressAllow=192.168.5.60), plus the model
-#     endpoints themselves when agy talks to them directly.
-# Out of the box (localhost only) the instance has NO external egress: a job
-# that needs the model fails fast until you allow its route. Operators whose
-# systemd lacks cgroup BPF support get a unit that fails to start rather than
-# an unfiltered one. DNS: prefer IP literals in PI_PROXY_URL; a hostname adds
-# a resolver dependency this allowlist does not cover by default.
+# allow exactly what the instance needs. The template deliberately allows
+# NOTHING: an instance without its egress drop-in cannot even accept the
+# bridge's connection, so an operator cannot forget the step and silently
+# serve a worker with a wider network than intended.
+#
+# The per-instance drop-in (see deploy/README.md, "Egress drop-in") allows:
+#   - the instance's own dedicated loopback address, the same one
+#     PI_LISTEN_ADDR names (for example IPAddressAllow=127.0.0.8/32), so the
+#     bridge reaches the endpoint while every OTHER host loopback service
+#     (a database, a docker socket's TCP port, another instance's endpoint)
+#     is denied to the worker;
+#   - the egress proxy that carries agy's model traffic (one line per proxy
+#     address, e.g. IPAddressAllow=192.168.5.60), plus the model endpoints
+#     themselves when agy talks to them directly.
+#
+# CAVEAT (corrects an earlier claim in this file): on a systemd or kernel
+# without cgroup BPF support these settings can be silently INEFFECTIVE -
+# the unit still starts. The egress negative controls in deploy/README.md
+# are the verification: if a worker probe to an unrelated destination
+# SUCCEEDS, the filter is not effective on this host and the endpoint must
+# not be exposed. DNS: prefer IP literals in PI_PROXY_URL; a hostname adds a
+# resolver dependency this allowlist does not cover by default.
 IPAddressDeny=any
-IPAddressAllow=localhost
 
 # Hardening that does not fight the sandbox: the launcher and bubblewrap need
 # to create mount and user namespaces, so PrivateDevices/PrivateTmp etc. are

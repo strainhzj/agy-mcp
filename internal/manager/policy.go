@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 
+	"github.com/tphakala/agy-mcp/v2/internal/config"
 	"github.com/tphakala/agy-mcp/v2/internal/jobstore"
 	"github.com/tphakala/agy-mcp/v2/internal/policy"
 )
@@ -21,24 +22,43 @@ import (
 // must name what is refused there, not restate the unrestricted defaults.
 func (m *Manager) Policy() policy.Policy { return m.cfg.Policy }
 
+// HTTPGuard returns the resolved HTTP transport limits (session idle timeout,
+// session count, in-flight requests, request rate). The zero value disables
+// every limit and the HTTP layer skips its guard middleware, which keeps
+// upstream behavior byte for byte.
+func (m *Manager) HTTPGuard() config.HTTPGuard { return m.cfg.HTTPGuard }
+
 // checkSessionPolicy applies the session access policy to a run request
-// before anything else resolves it. continue_latest must be refused before
-// normalizeRequest resolves it against agy's conversation cache: under a
-// policy that forbids continuation, reading the cache at all is the leak the
-// policy exists to prevent.
-func (m *Manager) checkSessionPolicy(req StartRequest) error {
+// before anything else resolves it, rewriting a managed-only handle into the
+// native conversation id it stands for (see sessionhandles.go).
+// continue_latest must be refused before normalizeRequest resolves it against
+// agy's conversation cache: under a policy that forbids continuation, reading
+// the cache at all is the leak the policy exists to prevent. Under
+// managed-only a native id or any other non-handle value is refused: the
+// caller only ever holds handles this instance issued.
+func (m *Manager) checkSessionPolicy(req *StartRequest) error {
 	p := m.cfg.Policy
 	if req.ContinueLatest && (p.DisableContinueLatest || !p.SessionsAllowed()) {
 		return fmt.Errorf("continue_latest is disabled by this server's session policy; start a fresh run and restate any needed context")
 	}
-	if req.ConversationID != "" && !p.SessionsAllowed() {
-		// managed-only would accept only a handle from this instance's own
-		// protected session index; that index is the Phase 3 machinery and
-		// does not exist yet, so until it lands a non-allow policy accepts no
-		// conversation_id at all. Native agy session ids, for instance, are
-		// never an authorization grant.
+	if req.ConversationID == "" {
+		return nil
+	}
+	if p.SessionsAllowed() {
+		return nil
+	}
+	if p.SessionPolicy != policy.SessionPolicyManagedOnly {
+		// disabled: no conversation id is accepted at all. Native agy session
+		// ids, for instance, are never an authorization grant.
 		return fmt.Errorf("conversation_id is not accepted by this server's session policy (%s); start a fresh run and restate any needed context", p.SessionPolicy)
 	}
+	native, err := m.resolveSessionHandle(req.ConversationID)
+	if err != nil {
+		return err
+	}
+	// The rest of the pipeline (gate key, agy args, meta, serialization) works
+	// on the native id; the caller keeps seeing only the handle it sent.
+	req.ConversationID = native
 	return nil
 }
 

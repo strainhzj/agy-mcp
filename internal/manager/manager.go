@@ -22,6 +22,7 @@ import (
 	"github.com/tphakala/agy-mcp/v2/internal/agyver"
 	"github.com/tphakala/agy-mcp/v2/internal/config"
 	"github.com/tphakala/agy-mcp/v2/internal/jobstore"
+	"github.com/tphakala/agy-mcp/v2/internal/policy"
 	"github.com/tphakala/agy-mcp/v2/internal/proc"
 )
 
@@ -34,6 +35,12 @@ type Manager struct {
 	cacheFile string     // agy conversation cache (last_conversations.json); injectable for tests
 	idemMu    sync.Mutex
 	idemKeys  map[string]bool // short-lived in-process idempotency claims; cross-process half lives in xlock
+
+	// sessionsMu serializes the managed-only session index's lookup-or-mint
+	// (two concurrent completions of the same conversation must observe one
+	// handle). The records themselves live in the state dir; see
+	// sessionhandles.go and jobstore/sessions.go.
+	sessionsMu sync.Mutex
 
 	// verifiedAgy is the agy path whose version has been checked and accepted in
 	// this process; verifyMu guards it. Caching the path (rather than a bare
@@ -408,12 +415,34 @@ func (m *Manager) AwaitConversationID(ctx context.Context, job Job) string {
 	// A session policy that forbids conversation identifiers also forbids
 	// reporting one: the id would be a live agy session handle the caller
 	// could hand straight back to conversation_id, which the policy refuses.
-	// The job still runs; only the handle is withheld.
-	if !m.cfg.Policy.SessionsAllowed() {
+	// The job still runs; only the handle is withheld. Under managed-only the
+	// withheld id reappears as the opaque continuation handle: a continuation
+	// already has one (its first turn minted it), a fresh run gets nothing
+	// here and its handle appears on the first completed Status read.
+	switch {
+	case m.cfg.Policy.SessionsAllowed():
+		return m.awaitConversationID(ctx, job, func(id string) string { return id })
+	case m.cfg.Policy.SessionPolicy == policy.SessionPolicyManagedOnly:
+		// Lookup only, never mint: minting is a completion event (see
+		// presentConversationID). A replay's Job.ConversationID may already be
+		// the handle (findIdempotentJob reads it off Status), so an id in
+		// handle shape passes through and a native id is looked up.
+		return m.awaitConversationID(ctx, job, func(id string) string {
+			if jobstore.ValidSessionHandle(id) {
+				return id
+			}
+			return m.handleForNative(id, job.ID, false)
+		})
+	default:
 		return ""
 	}
-	if job.ConversationID != "" {
-		return job.ConversationID
+}
+
+// awaitConversationID is AwaitConversationID's poll loop; present is applied
+// to every id the loop finds before it reaches the caller.
+func (m *Manager) awaitConversationID(ctx context.Context, job Job, present func(string) string) string {
+	if id := present(job.ConversationID); id != "" {
+		return id
 	}
 	// A job id this manager did not issue has no conversation to wait for, which is
 	// the same answer an expired budget gives.
@@ -424,7 +453,7 @@ func (m *Manager) AwaitConversationID(ctx context.Context, job Job) string {
 	deadline := time.Now().Add(m.conversationIDWait)
 	for {
 		if p, ok := jobstore.ReadProgressDir(dir); ok && p.ConversationID != "" {
-			return p.ConversationID
+			return present(p.ConversationID)
 		}
 		if _, terminal := m.store.ExitCode(job.ID); terminal {
 			// Re-read before giving up. The supervisor writes the progress file
@@ -432,7 +461,7 @@ func (m *Manager) AwaitConversationID(ctx context.Context, job Job) string {
 			// above has its id on disk even though the first read missed it;
 			// returning "" here without looking again would discard it.
 			if p, ok := jobstore.ReadProgressDir(dir); ok {
-				return p.ConversationID
+				return present(p.ConversationID)
 			}
 			return ""
 		}
@@ -586,7 +615,7 @@ func (m *Manager) findIdempotentJob(req StartRequest, args []string, skipPermiss
 // physical paths the check approved.
 func (m *Manager) normalizeRequest(req StartRequest) (StartRequest, error) {
 	p := m.cfg.Policy
-	if err := m.checkSessionPolicy(req); err != nil {
+	if err := m.checkSessionPolicy(&req); err != nil {
 		return StartRequest{}, err
 	}
 	if err := m.checkSchemaPolicy(&req); err != nil {
@@ -1028,14 +1057,32 @@ func (m *Manager) RestoreAndCollect() (removed []string, err error) {
 		}
 		m.restoreEvaluate(l)
 	}
+	// Best-effort sweeps after the strict pass: dead session handles are
+	// retired and the disk budget is enforced on startup too, so an oversized
+	// store is bounded before the first job is admitted rather than waiting
+	// for the first ticker tick.
+	m.gcExpiredSessions()
+	m.enforceStateBudget()
 	return removed, nil
 }
 
 // GarbageCollect removes jobs older than the configured TTL. A job whose
 // supervisor is still alive (including one that survived a manager restart) is
 // never removed, even past the TTL, so a live job is never deleted out from
-// under its supervisor. A non-positive TTL disables collection.
+// under its supervisor. A non-positive TTL disables job collection. The same
+// pass also retires expired managed-only session handles and enforces the
+// state disk budget when configured, so one ticker drives all three sweeps.
 func (m *Manager) GarbageCollect() ([]string, error) {
+	removed, err := m.collectExpiredJobs()
+	m.gcExpiredSessions()
+	m.enforceStateBudget()
+	return removed, err
+}
+
+// collectExpiredJobs is the TTL half of GarbageCollect, so the session and
+// budget sweeps can share the same entry point without inheriting its
+// JobTTL<=0 short-circuit.
+func (m *Manager) collectExpiredJobs() ([]string, error) {
 	if m.cfg.JobTTL <= 0 {
 		return nil, nil
 	}

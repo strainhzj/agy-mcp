@@ -360,6 +360,22 @@ func (m *Manager) checkConfigSources() CheckResult {
 	line("default timeout", "resolved", fmt.Sprintf("%s (%s)", m.cfg.DefaultTimeout, m.waitCapSource()))
 	line("sync wait cap", config.EnvSyncWaitCap, syncWaitCapSource())
 	line("session policy", config.EnvSessionPolicy, string(m.cfg.Policy.SessionPolicy))
+	if m.cfg.Policy.SessionPolicy == policy.SessionPolicyManagedOnly {
+		ttl := "default " + config.DefaultSessionTTL.String()
+		if v := os.Getenv(config.EnvSessionTTL); v != "" {
+			ttl = config.EnvSessionTTL + "=" + v
+		}
+		line("session ttl", "resolved", ttl)
+	}
+	if m.cfg.StateBudgetBytes > 0 {
+		line("state budget", "resolved", formatBytes(m.cfg.StateBudgetBytes))
+	}
+	if g := m.cfg.HTTPGuard; g.Limited() {
+		line("http session timeout", "resolved", g.SessionTimeout.String())
+		line("http max sessions", "resolved", strconv.Itoa(g.MaxSessions))
+		line("http max inflight", "resolved", strconv.Itoa(g.MaxInflight))
+		line("http rate", "resolved", fmt.Sprintf("%.1f req/s (burst %.0f)", g.RatePerSec, g.RatePerSec))
+	}
 	if len(m.cfg.Policy.AllowedRoots) > 0 {
 		line("allowed roots", config.EnvAllowedRoots, strings.Join(m.cfg.Policy.AllowedRoots, string(filepath.ListSeparator)))
 	} else {
@@ -380,6 +396,31 @@ func orUnset(v string) string {
 		return "unset (upstream behavior)"
 	}
 	return v
+}
+
+// sessionTTLLabel names the resolved handle expiry for the policy check.
+func sessionTTLLabel(ttl time.Duration) string {
+	if ttl <= 0 {
+		return "unset"
+	}
+	return ttl.String()
+}
+
+// formatBytes renders a byte count in the binary units AGY_MCP_STATE_BUDGET
+// accepts, so the doctor shows the budget in the same grammar that sets it.
+func formatBytes(n int64) string {
+	switch {
+	case n >= 1<<40:
+		return fmt.Sprintf("%.1fTiB", float64(n)/(1<<40))
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1fGiB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fMiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fKiB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }
 
 // syncWaitCapSource names how the inline-wait ceiling resolved: the variable,
@@ -480,7 +521,8 @@ func (m *Manager) checkPolicy() CheckResult {
 	p := m.cfg.Policy
 	if !p.Restricted() && p.Profile == "" && !p.RequireHTTPToken && p.SessionsAllowed() &&
 		!p.ForceSandbox && !p.DisableSkipPermissions && !p.DisableContinueLatest &&
-		p.MaxTimeout == 0 && len(p.AllowedModels) == 0 && len(p.AllowedAgents) == 0 {
+		p.MaxTimeout == 0 && len(p.AllowedModels) == 0 && len(p.AllowedAgents) == 0 &&
+		m.cfg.StateBudgetBytes == 0 && !m.cfg.HTTPGuard.Limited() && m.cfg.SessionTTL == 0 {
 		return CheckResult{checkPolicyName, CheckPass, "unrestricted (default)"}
 	}
 	// Re-validate a copy: ValidateAndNormalize rewrites path fields to
@@ -506,6 +548,15 @@ func (m *Manager) checkPolicy() CheckResult {
 		say("default cwd %s", recheck.DefaultCwd)
 	}
 	say("session policy %s", recheck.SessionPolicy)
+	if recheck.SessionPolicy == policy.SessionPolicyManagedOnly {
+		handles, herr := jobstore.ListSessionHandles(m.cfg.StateDir)
+		if herr != nil {
+			verdict = CheckFail
+			say("FAIL: cannot list the session index: %v", herr)
+		} else {
+			say("managed-only session index: %d handle(s) on disk, expiry %s", len(handles), sessionTTLLabel(m.cfg.SessionTTL))
+		}
+	}
 	if recheck.DisableContinueLatest {
 		say("continue_latest disabled")
 	}

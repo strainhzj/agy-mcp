@@ -228,9 +228,11 @@ func (m *Manager) Status(id string) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
-	if !m.cfg.Policy.SessionsAllowed() {
-		st.ConversationID = ""
-	}
+	// The output-side session gate: allow keeps the native id, managed-only
+	// maps it to this instance's opaque continuation handle (minting one when
+	// the run completed, which is what makes the handle's provenance a
+	// successful first turn), disabled strips it.
+	st.ConversationID = m.presentConversationID(id, st.State == StateDone, st.ConversationID)
 	return st, nil
 }
 

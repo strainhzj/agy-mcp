@@ -21,6 +21,11 @@ set -eu
 CG=${1:-/sys/fs/cgroup/agy-pi-review}
 RUN_USER=${2:-piagent}
 PROXY_PORT=${3:-3128}
+# Comma-separated outbound TCP port whitelist (defaults to the proxy port).
+# On a host where agy reaches the model endpoints directly, pass 443 here
+# (and keep the proxy port if one is used); the whitelist is destination
+# port only, so keep the list to exactly what the model traffic needs.
+ALLOW_TCP=${PI_SETUP_ALLOW_TCP:-$PROXY_PORT}
 MEM_MAX=${PI_SETUP_MEM_MAX:-1G}
 CPU_MAX=${PI_SETUP_CPU_MAX:-200000 100000}
 PIDS_MAX=${PI_SETUP_PIDS_MAX:-128}
@@ -66,17 +71,21 @@ chmod 700 "$CG"
 # users' traffic are untouched.
 nft list table inet agy_pi_review >/dev/null 2>&1 && nft delete table inet agy_pi_review
 CG_NAME=$(basename "$CG")
+case "$ALLOW_TCP" in
+    *,*) PORT_MATCH="{ $ALLOW_TCP }" ;;
+    *)   PORT_MATCH="$ALLOW_TCP" ;;
+esac
 nft -f - <<EOF
 table inet agy_pi_review {
 	chain egress {
 		type filter hook output priority filter; policy accept;
-		socket cgroupv2 level 1 "$CG_NAME" tcp dport != $PROXY_PORT counter drop
+		socket cgroupv2 level 1 "$CG_NAME" tcp dport != $PORT_MATCH counter drop
 	}
 }
 EOF
 
 printf 'ok: cgroup %s (memory=%s cpu=%s pids=%s) owned by %s\n' "$CG" "$MEM_MAX" "$CPU_MAX" "$PIDS_MAX" "$RUN_USER"
-printf 'ok: nft egress whitelist active for cgroup "%s": outbound tcp limited to port %s\n' "$CG_NAME" "$PROXY_PORT"
+printf 'ok: nft egress whitelist active for cgroup "%s": outbound tcp limited to port(s) %s\n' "$CG_NAME" "$ALLOW_TCP"
 printf 'verify (as %s, after the instance starts): a probe from inside the\n' "$RUN_USER"
 printf 'instance to an unrelated port must hang/deny while the proxy path works;\n'
 printf 'a probe that SUCCEEDS means the boundary is absent and the endpoint must\n'

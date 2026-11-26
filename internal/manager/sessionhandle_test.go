@@ -307,7 +307,10 @@ func TestAwaitConversationIDManagedOnly(t *testing.T) {
 }
 
 // foreignDir returns the job directory for the test's staged foreign job.
-func (m *Manager) foreignDir(t *testing.T) string { return m.jobDirT(t, "foreign") }
+func (m *Manager) foreignDir(t *testing.T) string {
+	t.Helper()
+	return m.jobDirT(t, "foreign")
+}
 
 // jobDirT resolves a staged job's directory.
 func (m *Manager) jobDirT(t *testing.T, id string) string {
@@ -320,7 +323,10 @@ func (m *Manager) jobDirT(t *testing.T, id string) string {
 }
 
 // storeRootT returns the job store root.
-func (m *Manager) storeRoot(t *testing.T) string { return filepath.Join(m.cfg.StateDir, "jobs") }
+func (m *Manager) storeRoot(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(m.cfg.StateDir, "jobs")
+}
 
 // TestStateBudgetEvictsOldestTerminal pins the disk bound: when the store
 // exceeds the budget, the sweep evicts the oldest completable terminal jobs

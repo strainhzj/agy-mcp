@@ -35,7 +35,7 @@ func TestGuardZeroLimitsPassthrough(t *testing.T) {
 	g := newHTTPGuard(config.HTTPGuard{})
 	for range 5 {
 		rec := httptest.NewRecorder()
-		g.middleware(stubHandler("")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+		g.middleware(stubHandler("")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("zero-limited guard rejected a request: %d", rec.Code)
 		}
@@ -49,21 +49,21 @@ func TestGuardRateLimit(t *testing.T) {
 	passed := 0
 	for range 3 {
 		rec := httptest.NewRecorder()
-		g.middleware(stubHandler("")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+		g.middleware(stubHandler("")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("burst request %d rejected with %d, want the full burst allowed", passed+1, rec.Code)
 		}
 		passed++
 	}
 	rec := httptest.NewRecorder()
-	g.middleware(stubHandler("")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	g.middleware(stubHandler("")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("over-burst request = %d, want 429", rec.Code)
 	}
 	// One second at 3/s refills at least one token.
 	time.Sleep(1100 * time.Millisecond)
 	rec = httptest.NewRecorder()
-	g.middleware(stubHandler("")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	g.middleware(stubHandler("")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("refilled request = %d, want 200", rec.Code)
 	}
@@ -83,12 +83,12 @@ func TestGuardMaxInflight(t *testing.T) {
 	done := make(chan int, 1)
 	go func() {
 		rec := httptest.NewRecorder()
-		g.middleware(handler).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+		g.middleware(handler).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 		done <- rec.Code
 	}()
 	inHandler.Wait() // the first request holds the only slot
 	rec := httptest.NewRecorder()
-	g.middleware(stubHandler("")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	g.middleware(stubHandler("")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("over-cap request = %d, want 503", rec.Code)
 	}
@@ -106,19 +106,19 @@ func TestGuardSessionCap(t *testing.T) {
 	g := newHTTPGuard(config.HTTPGuard{MaxSessions: 2, SessionTimeout: time.Minute})
 	for i := range 2 {
 		rec := httptest.NewRecorder()
-		g.middleware(stubHandler(fmt.Sprintf("sess-%d", i))).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+		g.middleware(stubHandler(fmt.Sprintf("sess-%d", i))).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("session %d = %d, want 200", i, rec.Code)
 		}
 	}
 	rec := httptest.NewRecorder()
-	g.middleware(stubHandler("sess-3")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	g.middleware(stubHandler("sess-3")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("third session = %d, want 429", rec.Code)
 	}
 	// A known session still passes at the cap.
 	rec = httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
 	req.Header.Set(mcpSessionHeader, "sess-0")
 	g.middleware(stubHandler("")).ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -132,18 +132,18 @@ func TestGuardSessionCap(t *testing.T) {
 func TestGuardIdleSessionEviction(t *testing.T) {
 	g := newHTTPGuard(config.HTTPGuard{MaxSessions: 1, SessionTimeout: 20 * time.Millisecond})
 	rec := httptest.NewRecorder()
-	g.middleware(stubHandler("sess-0")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	g.middleware(stubHandler("sess-0")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("first session = %d", rec.Code)
 	}
 	rec = httptest.NewRecorder()
-	g.middleware(stubHandler("sess-1")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	g.middleware(stubHandler("sess-1")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("second session at cap = %d, want 429", rec.Code)
 	}
 	time.Sleep(50 * time.Millisecond)
 	rec = httptest.NewRecorder()
-	g.middleware(stubHandler("sess-1")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	g.middleware(stubHandler("sess-1")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("session after idle eviction = %d, want 200", rec.Code)
 	}
@@ -155,16 +155,16 @@ func TestGuardIdleSessionEviction(t *testing.T) {
 // burst that was accepted.
 func TestGuardConcurrentRegistrationsDoNotLeak(t *testing.T) {
 	g := newHTTPGuard(config.HTTPGuard{MaxSessions: 4, SessionTimeout: time.Minute})
-	var accepted int32
+	var accepted atomic.Int32
 	var wg sync.WaitGroup
 	for i := range 50 {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
 			rec := httptest.NewRecorder()
-			g.middleware(stubHandler(fmt.Sprintf("sess-%d", n))).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+			g.middleware(stubHandler(fmt.Sprintf("sess-%d", n))).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
 			if rec.Code == http.StatusOK {
-				atomic.AddInt32(&accepted, 1)
+				accepted.Add(1)
 			}
 		}(i)
 	}
@@ -175,7 +175,7 @@ func TestGuardConcurrentRegistrationsDoNotLeak(t *testing.T) {
 	if tracked == 0 || tracked > 50 {
 		t.Fatalf("tracked sessions = %d, outside any sane bound", tracked)
 	}
-	if atomic.LoadInt32(&accepted) == 0 {
+	if accepted.Load() == 0 {
 		t.Fatal("every concurrent session refused; the cap is not being released")
 	}
 }

@@ -429,14 +429,14 @@ func parseByteSize(name, raw string) (int64, error) {
 
 // lookupPositiveDuration parses one duration variable that must be positive
 // when set. An unset variable returns (0, false, nil).
-func lookupPositiveDuration(name string) (time.Duration, bool, error) {
+func lookupPositiveDuration(name string) (d time.Duration, set bool, err error) {
 	raw, ok := os.LookupEnv(name)
 	if !ok || raw == "" {
 		return 0, false, nil
 	}
-	d, err := time.ParseDuration(raw)
-	if err != nil {
-		return 0, true, fmt.Errorf("%s %q: %w", name, raw, err)
+	d, perr := time.ParseDuration(raw)
+	if perr != nil {
+		return 0, true, fmt.Errorf("%s %q: %w", name, raw, perr)
 	}
 	if d <= 0 {
 		return 0, true, fmt.Errorf("%s %q: want a positive duration or unset", name, raw)
@@ -445,14 +445,15 @@ func lookupPositiveDuration(name string) (time.Duration, bool, error) {
 }
 
 // lookupPositiveInt parses one integer variable that must be positive when set.
-func lookupPositiveInt(name string) (int, bool, error) {
+func lookupPositiveInt(name string) (n int, set bool, err error) {
 	raw, ok := os.LookupEnv(name)
 	if !ok || raw == "" {
 		return 0, false, nil
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(raw))
-	if err != nil {
-		return 0, true, fmt.Errorf("%s %q: %w", name, raw, err)
+	var perr error
+	n, perr = strconv.Atoi(strings.TrimSpace(raw))
+	if perr != nil {
+		return 0, true, fmt.Errorf("%s %q: %w", name, raw, perr)
 	}
 	if n <= 0 {
 		return 0, true, fmt.Errorf("%s %q: want a positive integer or unset", name, raw)
@@ -461,13 +462,14 @@ func lookupPositiveInt(name string) (int, bool, error) {
 }
 
 // lookupPositiveFloat parses one float variable that must be positive when set.
-func lookupPositiveFloat(name string) (float64, bool, error) {
+func lookupPositiveFloat(name string) (f float64, set bool, err error) {
 	raw, ok := os.LookupEnv(name)
 	if !ok || raw == "" {
 		return 0, false, nil
 	}
-	f, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-	if err != nil {
+	var perr error
+	f, perr = strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if perr != nil {
 		return 0, true, fmt.Errorf("%s %q: want a positive number or unset", name, raw)
 	}
 	if f <= 0 {

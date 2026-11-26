@@ -29,23 +29,6 @@ import (
 // sessionHandleEntropy is the random bytes behind one handle (32 hex chars).
 const sessionHandleEntropy = 16
 
-// resolveConversationID turns a caller-supplied conversation_id into the
-// native id a run may carry, under the resolved session policy. It is the
-// single input-side choke point: allow passes through untouched (upstream),
-// disabled refuses (the caller there has no legitimate id at all), and
-// managed-only accepts only a handle this instance issued and still honors.
-func (m *Manager) resolveConversationID(raw string) (string, error) {
-	p := m.cfg.Policy
-	switch {
-	case p.SessionsAllowed():
-		return raw, nil
-	case p.SessionPolicy == policy.SessionPolicyManagedOnly:
-		return m.resolveSessionHandle(raw)
-	default:
-		return "", fmt.Errorf("conversation_id is not accepted by this server's session policy (%s); start a fresh run and restate any needed context", p.SessionPolicy)
-	}
-}
-
 // resolveSessionHandle resolves one opaque handle to its native conversation
 // id, refusing everything that is not exactly this deployment's own,
 // unexpired record. Every refusal carries the same message: unknown,

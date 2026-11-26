@@ -462,8 +462,11 @@ func TestFilterValues(t *testing.T) {
 
 func TestJoinAsWritten(t *testing.T) {
 	// joinAsWritten must not clean: the whole point is that the OS, not
-	// filepath.Join, resolves ".." past a symlink.
-	if got := joinAsWritten("/root", "../up"); got != "/root/../up" {
+	// filepath.Join, resolves ".." past a symlink. The separator in the
+	// expectation is the platform's own, because the function appends
+	// filepath.Separator and the assertion must hold on Windows too.
+	sep := string(filepath.Separator)
+	if got := joinAsWritten("/root", "../up"); got != "/root"+sep+"../up" {
 		t.Fatalf("joinAsWritten cleaned the path: %q", got)
 	}
 	if got := joinAsWritten("/root/", "../up"); got != "/root/../up" {

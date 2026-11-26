@@ -13,7 +13,7 @@ import (
 // call inside probeCmd must turn this red by assertion, not by a nil panic (see
 // the nil guard below), which is why the helper exists in one inspectable place.
 func TestProbeCmdSuppressesConsoleWindow(t *testing.T) {
-	cmd := probeCmd(context.Background(), "cmd.exe", "/c", "exit")
+	cmd := probeCmd(context.Background(), "cmd.exe", nil, "/c", "exit")
 	if cmd.SysProcAttr == nil {
 		t.Fatal("probeCmd must set SysProcAttr so window suppression is applied")
 	}
@@ -27,7 +27,7 @@ func TestProbeCmdSuppressesConsoleWindow(t *testing.T) {
 // their absence keeps probeCmd from quietly becoming an alias for ConfigureGroup
 // or StartDetached.
 func TestProbeCmdDoesNotGroupOrDetach(t *testing.T) {
-	cmd := probeCmd(context.Background(), "cmd.exe", "/c", "exit")
+	cmd := probeCmd(context.Background(), "cmd.exe", nil, "/c", "exit")
 	if cmd.SysProcAttr == nil {
 		t.Fatal("probeCmd must set SysProcAttr")
 	}

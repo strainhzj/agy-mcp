@@ -515,33 +515,7 @@ func (m *Manager) checkPolicy() CheckResult {
 			verdict = CheckFail
 			say("FAIL: the profile requires %s and %s; identity is empty", config.EnvProjectID, config.EnvInstanceID)
 		}
-		// The state dir must be attributable to this instance: any job whose
-		// ownership record is missing or names another project or instance
-		// means the directory is shared or reused, the same condition startup
-		// (RestoreAndCollect) refuses on. Ids are named: doctor is the
-		// operator's tool on the host, not a caller-facing surface.
-		ids, err := m.store.List()
-		if err != nil {
-			verdict = CheckFail
-			say("FAIL: cannot list the state dir to check job ownership: %v", err)
-		} else {
-			var foreign []string
-			for _, id := range ids {
-				dir, derr := m.store.Dir(id)
-				if derr != nil {
-					foreign = append(foreign, id)
-					continue
-				}
-				rec, rerr := readOwnershipRecord(dir)
-				if rerr != nil || rec.InstanceID != m.cfg.InstanceID || rec.ProjectID != m.cfg.ProjectID {
-					foreign = append(foreign, id)
-				}
-			}
-			if len(foreign) > 0 {
-				verdict = CheckFail
-				say("FAIL: %d job(s) in the state dir lack a matching ownership record (%s); the dir is shared or was reused, and startup will refuse it", len(foreign), strings.Join(foreign, ", "))
-			}
-		}
+		m.checkProtectedStore(&verdict, say)
 	}
 	// The standing reminder, on every restricted verdict. It is the one claim
 	// in this report the code cannot verify, so it is stated as what it is: a
@@ -564,4 +538,53 @@ func readOwnershipRecord(dir string) (jobOwnership, error) {
 		return jobOwnership{}, err
 	}
 	return rec, nil
+}
+
+// checkProtectedStore is the state-dir half of a protected instance's doctor
+// verdict: the ownership scan (the dir must hold no job this instance did not
+// create) and the deployment-record check (the launcher-written record is the
+// contract the server verifies at startup, so a missing or mismatched record
+// here is a deployment about to fail, or one being driven by a config that
+// bypassed the launcher). Ids are named in the FAIL lines: doctor is the
+// operator's tool on the host, not a caller-facing surface.
+func (m *Manager) checkProtectedStore(verdict *CheckStatus, say func(string, ...any)) {
+	ids, err := m.store.List()
+	if err != nil {
+		*verdict = CheckFail
+		say("FAIL: cannot list the state dir to check job ownership: %v", err)
+		return
+	}
+	var foreign []string
+	for _, id := range ids {
+		dir, derr := m.store.Dir(id)
+		if derr != nil {
+			foreign = append(foreign, id)
+			continue
+		}
+		rec, rerr := readOwnershipRecord(dir)
+		if rerr != nil || rec.InstanceID != m.cfg.InstanceID || rec.ProjectID != m.cfg.ProjectID || rec.SnapshotFingerprint != m.cfg.SnapshotFingerprint {
+			foreign = append(foreign, id)
+		}
+	}
+	if len(foreign) > 0 {
+		*verdict = CheckFail
+		say("FAIL: %d job(s) in the state dir lack a matching ownership record (%s); the dir is shared or was reused, and startup will refuse it", len(foreign), strings.Join(foreign, ", "))
+	}
+	rec, recErr := jobstore.ReadInstanceRecord(m.cfg.StateDir)
+	switch {
+	case recErr != nil:
+		*verdict = CheckFail
+		say("FAIL: no readable deployment record in the state dir (%v); a bare start is refused and the instance must be deployed by its launcher", recErr)
+	case rec.Contract != jobstore.InstanceContract:
+		*verdict = CheckFail
+		say("FAIL: deployment record contract %d is not understood by this build (want %d); redeploy the instance", rec.Contract, jobstore.InstanceContract)
+	case rec.ProjectID != m.cfg.ProjectID || rec.InstanceID != m.cfg.InstanceID:
+		*verdict = CheckFail
+		say("FAIL: the deployment record names project %s instance %s; this server is configured for project %s instance %s", rec.ProjectID, rec.InstanceID, m.cfg.ProjectID, m.cfg.InstanceID)
+	case rec.SnapshotFingerprint == "":
+		*verdict = CheckFail
+		say("FAIL: the deployment record carries no snapshot fingerprint; redeploy the instance")
+	default:
+		say("deployment record: project %s instance %s snapshot fingerprint %s", rec.ProjectID, rec.InstanceID, rec.SnapshotFingerprint)
+	}
 }

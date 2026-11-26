@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/tphakala/agy-mcp/v2/internal/agyver"
+	"github.com/tphakala/agy-mcp/v2/internal/config"
 )
 
 // WaitDelay fires when agy answered and exited but a descendant kept the output
@@ -46,7 +47,7 @@ func TestReadAgyVersionToleratesWaitDelay(t *testing.T) {
 			_ = p.Kill()
 		}
 	})
-	raw, err := readAgyVersion(t.Context(), script)
+	raw, err := readAgyVersion(t.Context(), script, config.SanitizeEnv(os.Environ()))
 	if err != nil {
 		t.Fatalf("readAgyVersion: %v; a descendant holding the pipe must not fail the probe", err)
 	}
@@ -73,7 +74,7 @@ func TestReadAgyVersionBoundsTheMergedOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := readAgyVersion(t.Context(), script)
+	got, err := readAgyVersion(t.Context(), script, config.SanitizeEnv(os.Environ()))
 	if err != nil {
 		t.Fatalf("readAgyVersion: %v", err)
 	}

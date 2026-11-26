@@ -3,6 +3,7 @@
 package manager
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -171,7 +172,9 @@ func TestSpawnEnvStrippedOfControlPlaneVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	m2 := newManager(t, managerOpts{agyPath: fake})
-	m2.readAgyVersion = readAgyVersion
+	m2.readAgyVersion = func(ctx context.Context, agy string) (string, error) {
+		return readAgyVersion(ctx, agy, config.SanitizeEnv(os.Environ()))
+	}
 	out, err := m2.readAgyVersion(t.Context(), fake)
 	if err != nil {
 		t.Fatalf("version probe: %v", err)

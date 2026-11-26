@@ -110,6 +110,14 @@ func TestCheckPolicyProtectedRequiresIdentity(t *testing.T) {
 func TestCheckPolicyProtectedFailsOnForeignJob(t *testing.T) {
 	root := canonicalTempDir(t)
 	state := canonicalTempDir(t)
+	if err := jobstore.WriteInstanceRecord(state, jobstore.InstanceRecord{
+		Contract:            jobstore.InstanceContract,
+		ProjectID:           "proj-1",
+		InstanceID:          "inst-1",
+		SnapshotFingerprint: "fp-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	m := New(config.Config{
 		StateDir: state,
 		Policy: policy.Policy{
@@ -117,8 +125,9 @@ func TestCheckPolicyProtectedFailsOnForeignJob(t *testing.T) {
 			AllowedRoots:  []string{root},
 			SessionPolicy: policy.SessionPolicyDisabled,
 		},
-		ProjectID:  "proj-1",
-		InstanceID: "inst-1",
+		ProjectID:           "proj-1",
+		InstanceID:          "inst-1",
+		SnapshotFingerprint: "fp-1",
 	})
 	dir, err := m.store.Create(jobstore.Meta{ID: "stray", StartedAt: time.Now(), BootID: readBootID()})
 	if err != nil {
@@ -137,8 +146,45 @@ func TestCheckPolicyProtectedFailsOnForeignJob(t *testing.T) {
 }
 
 // TestCheckPolicyProtectedCleanStorePasses: the happy path, so the foreign
-// failure cannot be satisfied by any nonzero scan outcome.
+// failure cannot be satisfied by any nonzero scan outcome. It needs a matching
+// deployment record too, since the record check is part of the protected
+// verdict.
 func TestCheckPolicyProtectedCleanStorePasses(t *testing.T) {
+	root := canonicalTempDir(t)
+	state := canonicalTempDir(t)
+	if err := jobstore.WriteInstanceRecord(state, jobstore.InstanceRecord{
+		Contract:            jobstore.InstanceContract,
+		ProjectID:           "proj-1",
+		InstanceID:          "inst-1",
+		SnapshotFingerprint: "fp-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := New(config.Config{
+		StateDir: state,
+		Policy: policy.Policy{
+			Profile:       policy.ProfilePi,
+			AllowedRoots:  []string{root},
+			SessionPolicy: policy.SessionPolicyDisabled,
+		},
+		ProjectID:           "proj-1",
+		InstanceID:          "inst-1",
+		SnapshotFingerprint: "fp-1",
+	})
+	got := m.checkPolicy()
+	if got.Status != CheckPass {
+		t.Fatalf("status = %v (%s), want PASS", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "deployment record") || !strings.Contains(got.Detail, "fp-1") {
+		t.Fatalf("detail = %q, want it to report the deployment record and fingerprint", got.Detail)
+	}
+}
+
+// TestCheckPolicyProtectedFailsWithoutDeploymentRecord covers the record half
+// of the protected verdict: a state dir without the launcher-written record
+// fails the check even with a clean ownership scan, because the start itself
+// would be refused.
+func TestCheckPolicyProtectedFailsWithoutDeploymentRecord(t *testing.T) {
 	root := canonicalTempDir(t)
 	m := New(config.Config{
 		StateDir: canonicalTempDir(t),
@@ -147,12 +193,16 @@ func TestCheckPolicyProtectedCleanStorePasses(t *testing.T) {
 			AllowedRoots:  []string{root},
 			SessionPolicy: policy.SessionPolicyDisabled,
 		},
-		ProjectID:  "proj-1",
-		InstanceID: "inst-1",
+		ProjectID:           "proj-1",
+		InstanceID:          "inst-1",
+		SnapshotFingerprint: "fp-1",
 	})
 	got := m.checkPolicy()
-	if got.Status != CheckPass {
-		t.Fatalf("status = %v (%s), want PASS", got.Status, got.Detail)
+	if got.Status != CheckFail {
+		t.Fatalf("status = %v (%s), want FAIL without a deployment record", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "deployment record") {
+		t.Fatalf("detail = %q, want it to name the missing deployment record", got.Detail)
 	}
 }
 

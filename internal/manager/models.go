@@ -140,6 +140,11 @@ func (m *Manager) runJSONProbe(ctx context.Context, label string, args []string,
 	if err != nil {
 		return nil, err
 	}
+	// One slot per listing under a protected policy, so the cheap tools cannot
+	// be turned into unbounded agy spawns (see Manager.probeGate). Upstream has
+	// no gate and acquires nothing.
+	release := m.probeSlot()
+	defer release()
 	// Bounded and WaitDelay'd for the same reason as the version probe: Output()
 	// collects through pipes that agy's descendants inherit, so one that outlives
 	// agy holds the read open and parks this call for as long as the client keeps
@@ -151,7 +156,7 @@ func (m *Manager) runJSONProbe(ctx context.Context, label string, args []string,
 	// subcommand; agy rejects `<sub> --output-format json` outright (the subcommand
 	// flagset does not define it). The listing banner stays on stderr, so stdout is
 	// the envelope alone.
-	cmd := probeCmd(ctx, agy, args...)
+	cmd := probeCmd(ctx, agy, m.probeEnv(), args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -159,9 +164,12 @@ func (m *Manager) runJSONProbe(ctx context.Context, label string, args []string,
 		proc.ConfigureSession(cmd)
 	}
 	cmd.WaitDelay = killGrace
-	var stdout bytes.Buffer
+	// stdout is bounded like stderr: a listing envelope is small, so a run
+	// away writer is a worker gone wrong, and the bound is what keeps one
+	// probe from pulling the control plane's memory with it.
+	stdout := &probeOutput{}
 	stderr := &probeOutput{}
-	cmd.Stdout = &stdout
+	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	err = cmd.Run()
 	out := stdout.Bytes()
@@ -245,6 +253,9 @@ func (w *probeOutput) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+// Bytes exposes the bounded capture for callers that hand it to a decoder.
+func (w *probeOutput) Bytes() []byte { return w.buf.Bytes() }
 
 func (w *probeOutput) String() string { return w.buf.String() }
 

@@ -75,6 +75,12 @@ type Manager struct {
 	quota     quotaCache
 	readUsage func(context.Context) ([]byte, error)
 	now       func() time.Time
+
+	// probeGate bounds how many listing probes (list_models, list_agents,
+	// agy_usage) a protected instance runs at once, so one caller cannot spend
+	// unbounded concurrency on agy spawns through the cheap tools. Nil keeps
+	// upstream behavior; set in New under a protected policy only.
+	probeGate chan struct{}
 }
 
 // New constructs a Manager.
@@ -98,8 +104,19 @@ func New(c config.Config) *Manager {
 		conversationIDWait:   c.ConversationIDWait,
 		restoredPollInterval: 2 * time.Second,
 		readStartTimeTicks:   readStartTimeTicks,
-		readAgyVersion:       readAgyVersion,
 		now:                  time.Now,
+	}
+	// The version-probe indirection routes through probeEnv so the probe's
+	// child environment follows the policy (strict under a protected profile).
+	m.readAgyVersion = func(ctx context.Context, agy string) (string, error) {
+		return readAgyVersion(ctx, agy, m.probeEnv())
+	}
+	// probeGate applies only to the listing probes (runJSONProbe); the
+	// cold-start version gate inside agyBinaryChecked stays unbounded, since
+	// every StartJob is already capped by the concurrency gate and the probe
+	// itself is bounded by its own timeout.
+	if c.Policy.Protected() {
+		m.probeGate = make(chan struct{}, protectedProbeConcurrency)
 	}
 	m.readUsage = func(ctx context.Context) ([]byte, error) {
 		return m.runJSONProbe(ctx, "/"+usageCommandName, usageProbeArgs(), "", true, usageProbeTimeout, usageProbeKillGrace)
@@ -199,15 +216,45 @@ func (m *Manager) markAgyVerified(agy string) {
 // probeCmd builds the command for one of the manager's short-lived agy probes.
 // It exists so the console-window suppression both probes need is applied in one
 // place a test can inspect, rather than being remembered separately at each site.
-func probeCmd(ctx context.Context, agy string, args ...string) *exec.Cmd {
+// env is the child environment the caller chose (see probeEnv); the probes exec
+// agy directly, so they carry the same environment rule as every other spawn
+// site, and under a protected policy that is the strict allowlist.
+func probeCmd(ctx context.Context, agy string, env []string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, agy, args...)
 	proc.ConfigureNoWindow(cmd)
 	// Same environment rule as every other spawn: the control-plane variables
 	// (the bearer token above all) never reach agy, including through the
 	// probes, which run with the caller's cwd as their working directory on
 	// the listing paths and would otherwise hand a workspace hook the token.
-	cmd.Env = config.SanitizeEnv(os.Environ())
+	cmd.Env = env
 	return cmd
+}
+
+// protectedProbeConcurrency is how many listing probes a protected instance
+// runs at once (see Manager.probeGate).
+const protectedProbeConcurrency = 2
+
+// probeSlot acquires one listing-probe slot when the instance bounds probe
+// concurrency (a protected policy) and returns the release func. A nil gate
+// keeps upstream behavior: no bound, no acquisition.
+func (m *Manager) probeSlot() func() {
+	if m.probeGate == nil {
+		return func() {}
+	}
+	m.probeGate <- struct{}{}
+	return func() { <-m.probeGate }
+}
+
+// probeEnv is the environment for one agy probe. Upstream strips the
+// control-plane prefix; a protected instance reduces the environment to the
+// strict child allowlist (config.SanitizeEnvStrict), because a probe's cwd can
+// be caller-named and its child agy runs hooks and plugins that must not
+// inherit anything else the control plane holds.
+func (m *Manager) probeEnv() []string {
+	if m.cfg.Policy.Protected() {
+		return config.SanitizeEnvStrict(os.Environ())
+	}
+	return config.SanitizeEnv(os.Environ())
 }
 
 // readAgyVersion runs `agy --version` and returns its raw output.
@@ -219,10 +266,10 @@ func probeCmd(ctx context.Context, agy string, args ...string) *exec.Cmd {
 // in case a future agy prints the version there. At most probeOutputLimit bytes
 // of the merged output are kept, so a runaway agy cannot make the caller hold an
 // unbounded buffer.
-func readAgyVersion(ctx context.Context, agy string) (string, error) {
+func readAgyVersion(ctx context.Context, agy string, env []string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, versionCheckTimeout)
 	defer cancel()
-	cmd := probeCmd(ctx, agy, "--version")
+	cmd := probeCmd(ctx, agy, env, "--version")
 	// Without this, killing the process on deadline does not unblock the output
 	// copy: the output copy reads through a pipe whose write end agy's descendants
 	// inherit, so a grandchild that outlives the kill holds the read open and the
@@ -486,15 +533,19 @@ func (m *Manager) findIdempotentJob(req StartRequest, args []string, skipPermiss
 		if meta.IdempotencyKey != req.IdempotencyKey {
 			continue
 		}
+		// Scope before comparison: a foreign or unattributed record is never
+		// this instance's binding, so it is skipped rather than judged, and the
+		// mismatch error below can only ever name this instance's own job id.
+		// Naming a foreign id here would hand a caller an identifier from
+		// another deployment purely by reusing its key; the state dir should
+		// never hold a foreign record at all (RestoreAndCollect refuses it at
+		// startup), so the skip is a defensive second line, and the retry
+		// proceeds to create this instance's own binding for the key.
+		if err := m.ownershipRefused(id); err != nil {
+			continue
+		}
 		if meta.Cwd != req.Cwd || !sameRequest(meta, req, args, skipPermissions) {
 			return Job{}, false, fmt.Errorf("idempotency_key %q is already bound to job %s with a different normalized request", req.IdempotencyKey, id)
-		}
-		// A protected instance replays only jobs it created itself: a foreign
-		// or unattributed record with the same key is refused exactly like any
-		// other out-of-scope handle, before its state or conversation id is
-		// read (see ownershipRefused).
-		if err := m.ownershipRefused(id); err != nil {
-			return Job{}, false, err
 		}
 		// A persisted record that never recorded a supervisor PID is a
 		// failed-creation remnant, not a job to replay. StartJob records PID>0 (via
@@ -1008,6 +1059,17 @@ func (m *Manager) GarbageCollect() ([]string, error) {
 // GarbageCollect's loop, factored out so the fused startup pass can reuse the one
 // loadJob result without re-reading meta.json.
 func (m *Manager) gcEvaluate(l loadedJob, cutoff time.Time) bool {
+	// A protected instance never deletes a job it cannot attribute: the
+	// ownership check is the same one Status applies, so a foreign, unowned
+	// or other-snapshot record in the state dir is kept untouched and
+	// reported to the operator, never reaped by a GC sweep that runs under a
+	// shared or misdirected directory. Startup (RestoreAndCollect) already
+	// refuses such a store; this keeps the background sweeps from becoming
+	// the deletion path that bypasses that refusal.
+	if err := m.ownershipRefused(l.id); err != nil {
+		log.Printf("GC: keeping job %s without a matching ownership record for this instance", l.id)
+		return false
+	}
 	if l.metaErr != nil {
 		if errors.Is(l.metaErr, fs.ErrNotExist) {
 			// meta.json is genuinely missing: an orphan from a crash between

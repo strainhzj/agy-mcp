@@ -298,7 +298,15 @@ func buildForeignRecord(t *testing.T, dir string) {
 
 func writeOwnershipRecord(t *testing.T, dir, project, instance string) {
 	t.Helper()
-	rec, err := json.Marshal(jobOwnership{Profile: policy.ProfilePi, ProjectID: project, InstanceID: instance})
+	writeOwnershipFingerprint(t, dir, project, instance, "")
+}
+
+// writeOwnershipFingerprint stages an ownership record with an explicit
+// snapshot fingerprint ("" means a record from before fingerprints existed,
+// which only matches an instance that itself has no fingerprint).
+func writeOwnershipFingerprint(t *testing.T, dir, project, instance, fingerprint string) {
+	t.Helper()
+	rec, err := json.Marshal(jobOwnership{Profile: policy.ProfilePi, ProjectID: project, InstanceID: instance, SnapshotFingerprint: fingerprint})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,11 +387,14 @@ func TestProtectedScopeRefusesForeignHandles(t *testing.T) {
 	}
 }
 
-// TestProtectedScopeReplayRefusesForeignJob covers idempotent replay: a key
-// bound to a foreign job must refuse the replay, not return the foreign job
-// id, even when the request matches. findIdempotentJob is the entry StartJob
-// uses, so this pins the path a retry actually takes.
-func TestProtectedScopeReplayRefusesForeignJob(t *testing.T) {
+// TestProtectedScopeReplaySkipsForeignJob covers idempotent replay scoping:
+// a key bound to a foreign job is never this instance's binding, so the scan
+// skips the record without naming it (the caller retries and creates this
+// instance's own binding for the key), while the same key with a different
+// request on this instance's OWN job still refuses, naming only its own id.
+// Naming a scanned foreign id in either message would hand a caller another
+// deployment's identifier just by reusing its key.
+func TestProtectedScopeReplaySkipsForeignJob(t *testing.T) {
 	if !proc.Supported {
 		t.Skip("job supervision unsupported on this platform")
 	}
@@ -398,12 +409,31 @@ func TestProtectedScopeReplayRefusesForeignJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	buildForeignRecord(t, fdir)
-	_, _, err = m.findIdempotentJob(req, buildAgyArgs(req), true)
-	if err == nil {
-		t.Fatal("replay of a foreign job returned a job")
+	job, found, err := m.findIdempotentJob(req, buildAgyArgs(req), true)
+	if err != nil || found {
+		t.Fatalf("foreign-keyed scan = %+v, %v, %v; want no binding and no error", job, found, err)
 	}
-	if !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("replay refusal = %v; want an fs.ErrNotExist-class error", err)
+
+	// The refusal keeps its teeth on this instance's own jobs: the same key
+	// with a different request names the job id, and that id is our own "j".
+	own, err := m.store.Load("j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	own.IdempotencyKey = "k"
+	own.RequestKey = requestKey(req)
+	own.Cwd = "/w"
+	own.Prompt = "p"
+	own.Timeout = time.Minute
+	own.PID = 999999
+	if err := m.store.UpdateMeta(own); err != nil {
+		t.Fatal(err)
+	}
+	other := req
+	other.Prompt = "a different request"
+	_, _, err = m.findIdempotentJob(other, buildAgyArgs(other), true)
+	if err == nil || !strings.Contains(err.Error(), "j") {
+		t.Fatalf("own mismatch = %v, want a refusal naming our own job j", err)
 	}
 }
 
@@ -512,5 +542,179 @@ func TestListSessionsDisabled(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "session policy") {
 			t.Fatalf("ListSessions under %s = %v; want a policy error", sp, err)
 		}
+	}
+}
+
+// TestProtectedScopeSnapshotFingerprintBindsReplay pins the snapshot-version
+// half of ownership: the fingerprint comes from the deployment record, so a
+// job created against one snapshot version is out of scope for the same
+// instance after the workspace is redeployed with new content. Replay skips
+// it (the retry creates a fresh binding) and Status refuses it like any other
+// foreign handle. Removing the fingerprint comparison in ownershipRefused
+// turns this red.
+func TestProtectedScopeSnapshotFingerprintBindsReplay(t *testing.T) {
+	if !proc.Supported {
+		t.Skip("job supervision unsupported on this platform")
+	}
+	root, _ := policyRoot(t)
+	m := newManager(t, managerOpts{
+		pol:                 restrictedPol(root),
+		projectID:           "p",
+		instanceID:          "i",
+		snapshotFingerprint: "fp-2",
+	})
+	req := StartRequest{Prompt: "p", Cwd: "/w", IdempotencyKey: "k", Timeout: time.Minute}
+	dir, err := m.store.Create(jobstore.Meta{
+		ID: "old-snapshot", IdempotencyKey: "k", RequestKey: requestKey(req),
+		Cwd: "/w", Prompt: "p", Timeout: time.Minute, StartedAt: time.Now(), BootID: readBootID(), PID: 999999,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The job belongs to this project and instance, but to the previous
+	// snapshot version.
+	writeOwnershipFingerprint(t, dir, "p", "i", "fp-1")
+
+	job, found, err := m.findIdempotentJob(req, buildAgyArgs(req), true)
+	if err != nil || found {
+		t.Fatalf("cross-snapshot replay = %+v, %v, %v; want no binding", job, found, err)
+	}
+	if _, err := m.Status("old-snapshot"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Status across snapshots = %v, want an fs.ErrNotExist-class error", err)
+	}
+	// The same fingerprint matches, so a redeployment that keeps the snapshot
+	// version (a plain restart) still replays its own jobs.
+	dir2, err := m.store.Create(jobstore.Meta{
+		ID: "same-snapshot", IdempotencyKey: "k2", RequestKey: requestKey(req),
+		Cwd: "/w", Prompt: "p", Timeout: time.Minute, StartedAt: time.Now(), BootID: readBootID(), PID: 999999,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeOwnershipFingerprint(t, dir2, "p", "i", "fp-2")
+	req2 := req
+	req2.IdempotencyKey = "k2"
+	if _, found, err := m.findIdempotentJob(req2, buildAgyArgs(req2), true); err != nil || !found {
+		t.Fatalf("same-snapshot replay = %v, %v; want the job replayed", found, err)
+	}
+}
+
+// TestGarbageCollectKeepsForeignJobs pins the deletion-side ownership gate:
+// a protected instance whose state directory holds another deployment's jobs
+// (a misdirected or shared dir) keeps them untouched in its GC sweeps, while
+// the owning instance collects them normally. Removing the ownershipRefused
+// call in gcEvaluate turns the first half red.
+func TestGarbageCollectKeepsForeignJobs(t *testing.T) {
+	if !proc.Supported {
+		t.Skip("job supervision unsupported on this platform")
+	}
+	root, _ := policyRoot(t)
+	state := t.TempDir()
+	a := newManager(t, managerOpts{stateDir: state, jobTTL: time.Hour, pol: restrictedPol(root), projectID: "pa", instanceID: "ia"})
+	b := newManager(t, managerOpts{stateDir: state, jobTTL: time.Hour, pol: restrictedPol(root), projectID: "pb", instanceID: "ib"})
+
+	dir, err := b.store.Create(jobstore.Meta{
+		ID: "b-expired", StartedAt: time.Now().Add(-2 * time.Hour), BootID: readBootID(), Cwd: root,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeOwnershipFingerprint(t, dir, "pb", "ib", "")
+	if err := b.store.WriteExitCode("b-expired", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := a.GarbageCollect()
+	if err != nil {
+		t.Fatalf("foreign instance GC: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("foreign instance removed %v; it must keep jobs it cannot attribute", removed)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("foreign job dir vanished: %v", err)
+	}
+
+	removed, err = b.GarbageCollect()
+	if err != nil {
+		t.Fatalf("owning instance GC: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != "b-expired" {
+		t.Fatalf("owning instance removed %v, want [b-expired]", removed)
+	}
+}
+
+// TestProtectedInterruptedPartialIsReportedFailed pins the Phase 1 restart
+// rule: a protected job whose supervisor died without a sentinel, with
+// streamed text but no result payload, is failed/interrupted with the partial
+// text kept, never a done. The upstream relabel (done+partial) is pinned
+// right behind it so the protected branch cannot leak into upstream behavior.
+func TestProtectedInterruptedPartialIsReportedFailed(t *testing.T) {
+	root, _ := policyRoot(t)
+	m := newManager(t, managerOpts{pol: restrictedPol(root), projectID: "p", instanceID: "i"})
+	dir, err := m.store.Create(jobstore.Meta{ID: "dead-partial", StartedAt: time.Now().Add(-time.Minute), BootID: "old-boot", Cwd: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeOwnershipFingerprint(t, dir, "p", "i", "")
+	if err := os.WriteFile(jobstore.OutPath(dir), []byte("partial streamed answer\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := m.Status("dead-partial")
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st.State != StateFailed || st.FailureReason != ReasonInterrupted {
+		t.Fatalf("protected interrupted = %s/%s, want failed/interrupted", st.State, st.FailureReason)
+	}
+	if !st.Partial || st.Result != "partial streamed answer" || st.Error == "" {
+		t.Fatalf("protected interrupted lost the partial text or the explanation: %+v", st)
+	}
+
+	up := newManager(t, managerOpts{})
+	udir, err := up.store.Create(jobstore.Meta{ID: "up-partial", StartedAt: time.Now().Add(-time.Minute), BootID: "old-boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jobstore.OutPath(udir), []byte("partial streamed answer\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ust, err := up.Status("up-partial")
+	if err != nil {
+		t.Fatalf("upstream Status: %v", err)
+	}
+	if ust.State != StateDone || !ust.Partial {
+		t.Fatalf("upstream interrupted = %s/%v, want the upstream done+partial", ust.State, ust.Partial)
+	}
+}
+
+// TestProtectedProbeGateBoundsConcurrency pins the listing-probe bound: a
+// protected instance hands out at most protectedProbeConcurrency probe slots,
+// and a held slot blocks the next acquisition until released.
+func TestProtectedProbeGateBoundsConcurrency(t *testing.T) {
+	root, _ := policyRoot(t)
+	m := newManager(t, managerOpts{pol: restrictedPol(root)})
+	m.probeGate = make(chan struct{}, protectedProbeConcurrency)
+	// Hold every slot the cap allows, then try for one more.
+	held := make([]func(), 0, protectedProbeConcurrency)
+	for range protectedProbeConcurrency {
+		held = append(held, m.probeSlot())
+	}
+	acquired := make(chan func(), 1)
+	go func() { acquired <- m.probeSlot() }()
+	select {
+	case r := <-acquired:
+		r()
+		t.Fatal("acquired a probe slot beyond the cap")
+	case <-time.After(150 * time.Millisecond):
+	}
+	for _, r := range held {
+		r()
+	}
+	select {
+	case r := <-acquired:
+		r()
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe slot not granted after release")
 	}
 }

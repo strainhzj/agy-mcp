@@ -286,7 +286,22 @@ func (m *Manager) status(id string) (Status, error) {
 	// left to write one), so freeze elapsed at the best available end time before
 	// classifying the outcome, so a recovered job's elapsed does not keep growing.
 	st.Elapsed = m.frozenElapsed(meta, st.Elapsed)
-	return recoverInterrupted(dir, meta, st), nil
+	recovered := recoverInterrupted(dir, meta, st)
+	// Upstream relabels a dead supervisor with streamed-but-unreaped text as
+	// done+partial, which fits its contract: the text is what agy produced, and
+	// upstream never claimed more than that. A protected deployment owes the
+	// opposite direction (the hardening plan's Phase 1 restart rule): the
+	// supervisor's death is an interruption the caller must be able to see, so
+	// the same partial text is kept but the job is reported failed/interrupted,
+	// never as a success. The relabel touches only the partial branch (Partial
+	// is set nowhere else in recoverInterrupted), leaving complete
+	// payload-backed results untouched.
+	if m.cfg.Policy.Protected() && recovered.Partial {
+		recovered.State = StateFailed
+		recovered.FailureReason = ReasonInterrupted
+		recovered.Error = "the supervisor exited before the job completed; the captured text is partial and may cut off mid-answer"
+	}
+	return recovered, nil
 }
 
 // recoverInterrupted classifies a job whose supervisor vanished without writing

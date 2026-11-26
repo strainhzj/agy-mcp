@@ -71,12 +71,17 @@ func (m *Manager) checkSchemaPolicy(req *StartRequest) error {
 // jobOwnership is the protected-instance ownership record stamped into every
 // job dir at creation. ProjectID and InstanceID come from the deployment
 // launcher (AGY_MCP_PROJECT_ID / AGY_MCP_INSTANCE_ID); no tool parameter can
-// supply either. Profile is recorded for the operator reading a state dir,
-// not for the match itself.
+// supply either. SnapshotFingerprint comes from the state directory's
+// deployment record (jobstore.InstanceRecord, also launcher-written) and binds
+// the job to one snapshot version: a redeployed snapshot is a new deployment,
+// not a continuation of the old one, so replays and status reads against a
+// changed snapshot refuse instead of serving stale results. Profile is
+// recorded for the operator reading a state dir, not for the match itself.
 type jobOwnership struct {
-	Profile    string `json:"profile"`
-	ProjectID  string `json:"project_id"`
-	InstanceID string `json:"instance_id"`
+	Profile             string `json:"profile"`
+	ProjectID           string `json:"project_id"`
+	InstanceID          string `json:"instance_id"`
+	SnapshotFingerprint string `json:"snapshot_fingerprint,omitempty"`
 }
 
 // writeOwnership stamps the ownership record onto a freshly created job dir.
@@ -89,9 +94,10 @@ func (m *Manager) writeOwnership(dir string) error {
 		return nil
 	}
 	b, err := json.Marshal(jobOwnership{
-		Profile:    m.cfg.Policy.Profile,
-		ProjectID:  m.cfg.ProjectID,
-		InstanceID: m.cfg.InstanceID,
+		Profile:             m.cfg.Policy.Profile,
+		ProjectID:           m.cfg.ProjectID,
+		InstanceID:          m.cfg.InstanceID,
+		SnapshotFingerprint: m.cfg.SnapshotFingerprint,
 	})
 	if err != nil {
 		return err
@@ -126,6 +132,16 @@ func (m *Manager) ownershipRefused(id string) error {
 		return unknownJobErr(id)
 	}
 	if own.InstanceID != m.cfg.InstanceID || own.ProjectID != m.cfg.ProjectID {
+		return unknownJobErr(id)
+	}
+	// The snapshot version is part of ownership: a deployment's identity
+	// covers the snapshot it serves, so a record from another snapshot is as
+	// out of scope as one from another instance. An empty record fingerprint
+	// only matches an instance without one, which a deployed instance cannot
+	// be: verifyDeploymentRecord refuses a record without a fingerprint, so a
+	// match here would mean a hand-built config, and the fail-closed reading
+	// is to refuse.
+	if own.SnapshotFingerprint != m.cfg.SnapshotFingerprint {
 		return unknownJobErr(id)
 	}
 	return nil

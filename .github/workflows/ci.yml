@@ -20,6 +20,9 @@ jobs:
   build:
     name: Build and test
     strategy:
+      # Keep every leg running so one failing OS still yields the others'
+      # evidence in the same run.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -37,7 +40,9 @@ jobs:
       - run: go vet ./...
       - name: Test (race)
         if: matrix.os == 'ubuntu-latest'
-        run: go test ./... -race -coverprofile=coverage.out -covermode=atomic
+        run: |
+          go test ./... -race -coverprofile=coverage.out -covermode=atomic | tee go-test-output.txt
+          exit ${PIPESTATUS[0]}
       - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest'
         uses: codecov/codecov-action@v7
@@ -48,10 +53,29 @@ jobs:
       # windows-latest runner does not provide on PATH.
       - name: Test (Windows)
         if: matrix.os == 'windows-latest'
-        run: go test ./...
+        run: |
+          go test ./... 2>&1 | Tee-Object -FilePath go-test-output.txt
+          exit $LASTEXITCODE
       - name: Test (macOS, race)
         if: matrix.os == 'macos-latest'
-        run: go test ./... -race
+        run: |
+          go test ./... -race | tee go-test-output.txt
+          exit ${PIPESTATUS[0]}
+      # Actions job logs are auth-gated even on public repos, so a failure leg
+      # cannot be read without signing in. Surface the failing tests as check
+      # annotations, which the API returns without authentication.
+      - name: Surface go test failures as annotations
+        if: always() && matrix.os != 'ubuntu-latest'
+        shell: pwsh
+        run: |
+          if (Test-Path go-test-output.txt) {
+            Select-String -Path go-test-output.txt -Pattern '^--- FAIL' | Select-Object -First 20 | ForEach-Object {
+              Write-Output "::error title=go test failure::$($_.Line)"
+            }
+            Select-String -Path go-test-output.txt -Pattern 'panic:|missing argument|unexpected ' | Select-Object -First 10 | ForEach-Object {
+              Write-Output "::error::$($_.Line)"
+            }
+          }
   lint:
     name: Lint
     runs-on: ubuntu-latest

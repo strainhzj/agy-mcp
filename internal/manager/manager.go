@@ -621,6 +621,18 @@ func (m *Manager) normalizeRequest(req StartRequest) (StartRequest, error) {
 	if err := m.checkSchemaPolicy(&req); err != nil {
 		return StartRequest{}, err
 	}
+	// The --mode flag is a server decision, never a caller's. A policy that
+	// disables the client mode refuses any value here (the tool layer already
+	// refused the key's mere presence, including an empty string; this is the
+	// manager-side backstop for a direct StartJob caller); a policy with a fixed
+	// mode replaces whatever the caller sent. With neither set the caller's
+	// value passes through, which is upstream behavior.
+	if p.Mode.DisableClientMode && req.Mode != "" {
+		return StartRequest{}, fmt.Errorf("mode is not accepted by this server; the server decides whether agy runs with a mode")
+	}
+	if p.Mode.FixedMode != "" {
+		req.Mode = p.Mode.FixedMode
+	}
 	if p.ForceSandbox {
 		req.Sandbox = true
 	}

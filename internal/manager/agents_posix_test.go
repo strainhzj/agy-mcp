@@ -81,6 +81,31 @@ func TestListAgentsWithCwdListsProjectAgents(t *testing.T) {
 	}
 }
 
+// TestListAgentsDisabledReturnsEmptyWithoutExec pins the agent-selection
+// default a protected instance resolves to: the listing answers empty and agy
+// is never exec'd, so no host-side agent catalog can leak through it. The
+// fake agy here would answer with agents if it ran, so a non-empty result or a
+// spawn proves the gate moved. Removing the DisableAgentSelection branch in
+// ListAgents turns this red.
+func TestListAgentsDisabledReturnsEmptyWithoutExec(t *testing.T) {
+	root, _ := policyRoot(t)
+	agy := testutil.WriteFakeAgy(t, testutil.FakeAgy{Agents: []string{"reviewer"}})
+	m := New(config.Config{
+		AgyPath: agy, StateDir: t.TempDir(), MaxConcurrency: 4,
+		Policy: restrictedPol(root),
+	})
+	if !m.Policy().DisableAgentSelection {
+		t.Fatal("the protected policy fixture stopped defaulting agent selection off")
+	}
+	got, err := m.ListAgents(t.Context(), "")
+	if err != nil {
+		t.Fatalf("ListAgents under DisableAgentSelection: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListAgents = %v, want an empty slice; no host agent name may be exposed", got)
+	}
+}
+
 // TestListAgentsWithoutCwdAddsNoWorkspace guards the unchanged behaviour: an
 // empty cwd passes no --add-dir, unlike agy_run, which defaults an empty cwd to
 // the server's directory. The fake would serve the project agents if the server's

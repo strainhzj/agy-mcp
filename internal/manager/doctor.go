@@ -426,6 +426,12 @@ func formatBytes(n int64) string {
 // syncWaitCapSource names how the inline-wait ceiling resolved: the variable,
 // or the built-in default when the variable is unset or unparseable. The
 // value itself is not secret, so it is shown.
+//
+// The profile makes the variable mandatory and strictly parsed, so for a
+// protected instance "unset" is not a state this server can be in: it would
+// have refused to start. Reporting it as the upstream silent fallback would
+// describe a deployment that cannot exist, so the profile's reading is named
+// explicitly.
 func syncWaitCapSource() string {
 	if v := os.Getenv(config.EnvSyncWaitCap); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
@@ -434,6 +440,48 @@ func syncWaitCapSource() string {
 		return "unset (unparseable value ignored), default " + config.DefaultSyncWaitCap.String()
 	}
 	return "unset, default " + config.DefaultSyncWaitCap.String()
+}
+
+// protectedPolicyLines appends the profile-only settings an operator needs to
+// see when reading a doctor report: the project manifest (what the instance
+// serves and where the snapshot lives), the Host allowlist that replaced the
+// SDK's localhost check, and the mode decision. These are the settings whose
+// absence or misconfiguration is a startup refusal, so naming them here is
+// what makes the refusal explainable after the fact.
+func (m *Manager) protectedPolicyLines(say func(string, ...any)) {
+	p := m.cfg.Policy
+	if p.ProjectManifestPath != "" {
+		say("project manifest %s", p.ProjectManifestPath)
+	} else {
+		say("FAIL: no project manifest; the profile requires %s", config.EnvProjectManifest)
+	}
+	if p.SnapshotRoot != "" {
+		say("snapshot root %s, fingerprint %s", p.SnapshotRoot, shortFingerprint(p.SnapshotFingerprint))
+	}
+	if len(p.AllowedHosts) > 0 {
+		say("http allowed hosts %s", strings.Join(p.AllowedHosts, ", "))
+	} else {
+		say("FAIL: no HTTP Host allowlist; the profile requires %s", config.EnvHTTPAllowedHosts)
+	}
+	say("client mode refused; server passes no --mode unless a measured fixed mode is configured")
+	if p.DisableAgentSelection {
+		say("agent selection disabled; list_agents returns nothing")
+	} else if len(p.AllowedAgents) > 0 {
+		say("agent whitelist %s", strings.Join(p.AllowedAgents, ", "))
+	}
+}
+
+// shortFingerprint renders a snapshot fingerprint for a report line: the
+// algorithm tag plus the first 12 hex characters, which is enough to tell two
+// versions apart without wrapping the terminal in 64 characters.
+func shortFingerprint(fp string) string {
+	if fp == "" {
+		return "unset"
+	}
+	if len(fp) <= 19 {
+		return fp
+	}
+	return fp[:19] + "..."
 }
 
 // waitCapSource names what produced the effective default timeout: the policy
@@ -566,6 +614,7 @@ func (m *Manager) checkPolicy() CheckResult {
 			verdict = CheckFail
 			say("FAIL: the profile requires %s and %s; identity is empty", config.EnvProjectID, config.EnvInstanceID)
 		}
+		m.protectedPolicyLines(say)
 		m.checkProtectedStore(&verdict, say)
 	}
 	// The standing reminder, on every restricted verdict. It is the one claim
@@ -613,7 +662,7 @@ func (m *Manager) checkProtectedStore(verdict *CheckStatus, say func(string, ...
 			continue
 		}
 		rec, rerr := readOwnershipRecord(dir)
-		if rerr != nil || rec.InstanceID != m.cfg.InstanceID || rec.ProjectID != m.cfg.ProjectID || rec.SnapshotFingerprint != m.cfg.SnapshotFingerprint {
+		if rerr != nil || !m.ownershipMatches(rec) {
 			foreign = append(foreign, id)
 		}
 	}

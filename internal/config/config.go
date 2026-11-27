@@ -110,6 +110,13 @@ type Config struct {
 	// profile, and is stamped into every job's ownership record so ownership
 	// and idempotent replay are bound to one snapshot version.
 	SnapshotFingerprint string
+
+	// SyncWaitCap is the resolved inline-wait ceiling for agy_run_sync and
+	// agy_wait. SyncWaitCapSet records whether AGY_MCP_SYNC_WAIT_CAP was
+	// explicitly set: the pi profile requires it, while an unset variable keeps
+	// the upstream default. mcptools reads it through Manager.SyncWaitCap.
+	SyncWaitCap    time.Duration
+	SyncWaitCapSet bool
 }
 
 // baseConfig returns a Config carrying exactly the defaults shared by Resolve
@@ -380,8 +387,9 @@ func ResolveWait() (Config, error) {
 	// Some AGY_MCP_ variables are read nowhere in this package: AGY_MCP_WAIT_READY_FILE,
 	// which the wait subcommands read in package main (see waitReadyFileEnv) at the
 	// instant their signal handler is installed, and AGY_MCP_SYNC_WAIT_CAP, which
-	// mcptools reads when it resolves the inline-wait ceiling (see envSyncWaitCap).
-	// Both are consumed past the point a resolved Config is threaded to, so routing
+	// mcptools reads through Manager.SyncWaitCap (resolved in Resolve, so a protected
+	// instance can refuse a missing or unparseable value instead of silently falling
+	// back). Both are consumed past the point a resolved Config is threaded to, so routing
 	// them through here would buy uniformity at the cost of carrying the values
 	// through more signatures. Noted so an audit of the env surface from this file is
 	// not misled. (AGY_MCP_AGY_PATH is also absent here, but for the reason this

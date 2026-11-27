@@ -89,8 +89,12 @@ func TestCheckPolicyProtectedRequiresIdentity(t *testing.T) {
 		StateDir: t.TempDir(),
 		Policy: policy.Policy{
 			Profile:       policy.ProfilePi,
-			AllowedRoots:  []string{root},
+			AllowedRoots:  []string{"/workspace"},
+			WorkerMount:   "/workspace",
+			SnapshotRoot:  root,
 			SessionPolicy: policy.SessionPolicyDisabled,
+			AllowedHosts:  []string{"127.0.0.8:8765"},
+			Mode:          policy.ModePolicy{DisableClientMode: true},
 		},
 	})
 	got := m.checkPolicy()
@@ -122,8 +126,12 @@ func TestCheckPolicyProtectedFailsOnForeignJob(t *testing.T) {
 		StateDir: state,
 		Policy: policy.Policy{
 			Profile:       policy.ProfilePi,
-			AllowedRoots:  []string{root},
+			AllowedRoots:  []string{"/workspace"},
+			WorkerMount:   "/workspace",
+			SnapshotRoot:  root,
 			SessionPolicy: policy.SessionPolicyDisabled,
+			AllowedHosts:  []string{"127.0.0.8:8765"},
+			Mode:          policy.ModePolicy{DisableClientMode: true},
 		},
 		ProjectID:           "proj-1",
 		InstanceID:          "inst-1",
@@ -164,8 +172,12 @@ func TestCheckPolicyProtectedCleanStorePasses(t *testing.T) {
 		StateDir: state,
 		Policy: policy.Policy{
 			Profile:       policy.ProfilePi,
-			AllowedRoots:  []string{root},
+			AllowedRoots:  []string{"/workspace"},
+			WorkerMount:   "/workspace",
+			SnapshotRoot:  root,
 			SessionPolicy: policy.SessionPolicyDisabled,
+			AllowedHosts:  []string{"127.0.0.8:8765"},
+			Mode:          policy.ModePolicy{DisableClientMode: true},
 		},
 		ProjectID:           "proj-1",
 		InstanceID:          "inst-1",
@@ -190,8 +202,12 @@ func TestCheckPolicyProtectedFailsWithoutDeploymentRecord(t *testing.T) {
 		StateDir: canonicalTempDir(t),
 		Policy: policy.Policy{
 			Profile:       policy.ProfilePi,
-			AllowedRoots:  []string{root},
+			AllowedRoots:  []string{"/workspace"},
+			WorkerMount:   "/workspace",
+			SnapshotRoot:  root,
 			SessionPolicy: policy.SessionPolicyDisabled,
+			AllowedHosts:  []string{"127.0.0.8:8765"},
+			Mode:          policy.ModePolicy{DisableClientMode: true},
 		},
 		ProjectID:           "proj-1",
 		InstanceID:          "inst-1",
@@ -203,6 +219,109 @@ func TestCheckPolicyProtectedFailsWithoutDeploymentRecord(t *testing.T) {
 	}
 	if !strings.Contains(got.Detail, "deployment record") {
 		t.Fatalf("detail = %q, want it to name the missing deployment record", got.Detail)
+	}
+}
+
+// TestCheckPolicyProtectedReportsNewGates pins the profile-only lines
+// doctor now reports: the project manifest, the snapshot root and fingerprint,
+// the Host allowlist, the mode decision and the agent-selection state. These
+// are the settings whose absence is a startup refusal, so naming them in the
+// report is what makes a refusal explainable after the fact. Removing
+// protectedPolicyLines (or any of its branches) turns the corresponding
+// assertion red.
+func TestCheckPolicyProtectedReportsNewGates(t *testing.T) {
+	root := canonicalTempDir(t)
+	state := canonicalTempDir(t)
+	fingerprint := "sha256:" + strings.Repeat("a", 64)
+	if err := jobstore.WriteInstanceRecord(state, jobstore.InstanceRecord{
+		Contract:            jobstore.InstanceContract,
+		ProjectID:           "proj-1",
+		InstanceID:          "inst-1",
+		SnapshotFingerprint: fingerprint,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := New(config.Config{
+		StateDir: state,
+		Policy: policy.Policy{
+			Profile:               policy.ProfilePi,
+			AllowedRoots:          []string{"/workspace"},
+			DefaultCwd:            "/workspace",
+			WorkerMount:           "/workspace",
+			SnapshotRoot:          root,
+			SnapshotFingerprint:   fingerprint,
+			SessionPolicy:         policy.SessionPolicyDisabled,
+			AllowedHosts:          []string{"192.168.5.45:8865", "127.0.0.8:8765"},
+			Mode:                  policy.ModePolicy{DisableClientMode: true},
+			DisableAgentSelection: true,
+			ProjectManifestPath:   "/etc/agy-mcp/pi-instance/project-manifest.json",
+		},
+		ProjectID:           "proj-1",
+		InstanceID:          "inst-1",
+		SnapshotFingerprint: fingerprint,
+	})
+	got := m.checkPolicy()
+	if got.Status != CheckPass {
+		t.Fatalf("status = %v (%s), want PASS", got.Status, got.Detail)
+	}
+	for _, want := range []string{
+		"project manifest /etc/agy-mcp/pi-instance/project-manifest.json",
+		"snapshot root " + root,
+		"http allowed hosts 192.168.5.45:8865, 127.0.0.8:8765",
+		"client mode refused",
+		"agent selection disabled",
+	} {
+		if !strings.Contains(got.Detail, want) {
+			t.Errorf("detail lacks %q:\n%s", want, got.Detail)
+		}
+	}
+	// The snapshot-root line abbreviates the fingerprint: a report line is not
+	// the place for 64 hex characters. (The deployment-record line below prints
+	// it in full by design, because that is the value an operator compares
+	// against the manifest when a start is refused.)
+	var snapshotLine string
+	for l := range strings.Lines(got.Detail) {
+		line := strings.TrimSuffix(l, "\n")
+		if strings.Contains(line, "snapshot root "+root) {
+			snapshotLine = line
+		}
+	}
+	if snapshotLine == "" {
+		t.Fatalf("detail lacks the snapshot root line:\n%s", got.Detail)
+	}
+	if strings.Contains(snapshotLine, fingerprint) {
+		t.Errorf("snapshot root line printed the full fingerprint %q; want the abbreviated form", fingerprint)
+	}
+	if !strings.Contains(snapshotLine, "sha256:aaaaaaaaaaaa") {
+		t.Errorf("snapshot root line %q lacks the abbreviated fingerprint", snapshotLine)
+	}
+}
+
+// TestCheckPolicyProtectedFailsWithoutManifest pins the manifest half of the
+// fail-closed verdict: a protected policy that lost its manifest fails the
+// check and names the variable, rather than passing on the other settings.
+func TestCheckPolicyProtectedFailsWithoutManifest(t *testing.T) {
+	root := canonicalTempDir(t)
+	m := New(config.Config{
+		StateDir: canonicalTempDir(t),
+		Policy: policy.Policy{
+			Profile:       policy.ProfilePi,
+			AllowedRoots:  []string{"/workspace"},
+			WorkerMount:   "/workspace",
+			SnapshotRoot:  root,
+			SessionPolicy: policy.SessionPolicyDisabled,
+			AllowedHosts:  []string{"127.0.0.8:8765"},
+			Mode:          policy.ModePolicy{DisableClientMode: true},
+		},
+		ProjectID:  "proj-1",
+		InstanceID: "inst-1",
+	})
+	got := m.checkPolicy()
+	if got.Status != CheckFail {
+		t.Fatalf("status = %v (%s), want FAIL without a manifest", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, config.EnvProjectManifest) {
+		t.Fatalf("detail = %q, want it to name %s", got.Detail, config.EnvProjectManifest)
 	}
 }
 

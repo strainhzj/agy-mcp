@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"time"
 
 	"github.com/tphakala/agy-mcp/v2/internal/config"
 	"github.com/tphakala/agy-mcp/v2/internal/jobstore"
@@ -27,6 +28,13 @@ func (m *Manager) Policy() policy.Policy { return m.cfg.Policy }
 // every limit and the HTTP layer skips its guard middleware, which keeps
 // upstream behavior byte for byte.
 func (m *Manager) HTTPGuard() config.HTTPGuard { return m.cfg.HTTPGuard }
+
+// SyncWaitCap returns the resolved inline-wait ceiling for agy_run_sync and
+// agy_wait. A zero value means "not resolved", which the tool layer reads as
+// "fall back to the environment/default path" so a hand-built Config (the
+// tests, and the wait subcommands that never admit jobs) keeps the historical
+// behavior.
+func (m *Manager) SyncWaitCap() time.Duration { return m.cfg.SyncWaitCap }
 
 // checkSessionPolicy applies the session access policy to a run request
 // before anything else resolves it, rewriting a managed-only handle into the
@@ -89,14 +97,20 @@ func (m *Manager) checkSchemaPolicy(req *StartRequest) error {
 }
 
 // jobOwnership is the protected-instance ownership record stamped into every
+// jobOwnership is the protected-instance ownership record stamped into every
 // job dir at creation. ProjectID and InstanceID come from the deployment
 // launcher (AGY_MCP_PROJECT_ID / AGY_MCP_INSTANCE_ID); no tool parameter can
-// supply either. SnapshotFingerprint comes from the state directory's
-// deployment record (jobstore.InstanceRecord, also launcher-written) and binds
-// the job to one snapshot version: a redeployed snapshot is a new deployment,
-// not a continuation of the old one, so replays and status reads against a
-// changed snapshot refuse instead of serving stale results. Profile is
-// recorded for the operator reading a state dir, not for the match itself.
+// supply either. SnapshotFingerprint comes from the project manifest (and the
+// launcher-written deployment record, which must agree with it) and binds the
+// job to one snapshot version: a redeployed snapshot is a new deployment, not
+// a continuation of the old one, so replays and status reads against a changed
+// snapshot refuse instead of serving stale results.
+//
+// All four fields are part of the match. Profile is not decoration: a record
+// written by an unprotected instance (which writes no ownership file at all)
+// or by a future profile is as out of scope as one from another project, and
+// matching on the other three alone would let a tampered or hand-built record
+// through.
 type jobOwnership struct {
 	Profile             string `json:"profile"`
 	ProjectID           string `json:"project_id"`
@@ -125,6 +139,18 @@ func (m *Manager) writeOwnership(dir string) error {
 	return jobstore.WriteOwnershipFile(dir, b)
 }
 
+// ownershipMatches reports whether a decoded ownership record names exactly
+// this deployment: profile, project, instance and snapshot version, all four.
+// It is the single comparison both the caller-facing gate (ownershipRefused)
+// and the operator-facing doctor scan use, so the two cannot disagree about
+// what "this instance's job" means.
+func (m *Manager) ownershipMatches(own jobOwnership) bool {
+	return own.Profile == m.cfg.Policy.Profile &&
+		own.ProjectID == m.cfg.ProjectID &&
+		own.InstanceID == m.cfg.InstanceID &&
+		own.SnapshotFingerprint == m.cfg.SnapshotFingerprint
+}
+
 // ownershipRefused reports whether a protected instance must treat id as an
 // unknown job. The error it returns is shaped exactly like a missing job
 // (errors.Is(err, fs.ErrNotExist)): unknown and out-of-scope handles are
@@ -151,17 +177,7 @@ func (m *Manager) ownershipRefused(id string) error {
 	if err := json.Unmarshal(b, &own); err != nil {
 		return unknownJobErr(id)
 	}
-	if own.InstanceID != m.cfg.InstanceID || own.ProjectID != m.cfg.ProjectID {
-		return unknownJobErr(id)
-	}
-	// The snapshot version is part of ownership: a deployment's identity
-	// covers the snapshot it serves, so a record from another snapshot is as
-	// out of scope as one from another instance. An empty record fingerprint
-	// only matches an instance without one, which a deployed instance cannot
-	// be: verifyDeploymentRecord refuses a record without a fingerprint, so a
-	// match here would mean a hand-built config, and the fail-closed reading
-	// is to refuse.
-	if own.SnapshotFingerprint != m.cfg.SnapshotFingerprint {
+	if !m.ownershipMatches(own) {
 		return unknownJobErr(id)
 	}
 	return nil

@@ -81,6 +81,19 @@ const (
 	// resolvable, independent of JobTTL. It is only valid together with
 	// AGY_MCP_SESSION_POLICY=managed-only.
 	EnvSessionTTL = "AGY_MCP_SESSION_TTL"
+	// EnvProjectManifest is the absolute path of the project manifest a
+	// protected instance loads. Required under the pi profile.
+	EnvProjectManifest = "AGY_MCP_PROJECT_MANIFEST"
+	// EnvHTTPAllowedHosts is the comma-separated HTTP Host header allowlist.
+	// Required under the pi profile.
+	EnvHTTPAllowedHosts = "AGY_MCP_HTTP_ALLOWED_HOSTS"
+	// EnvDisableMode removes the mode parameter from the tool schema and
+	// refuses any request carrying it. Forced true under the pi profile.
+	EnvDisableMode = "AGY_MCP_DISABLE_MODE"
+	// EnvFixedMode is the value the server passes as agy's --mode. Empty (the
+	// default) passes no --mode at all; a non-empty value must be on the
+	// measured-mode whitelist or the start is refused.
+	EnvFixedMode = "AGY_MCP_FIXED_MODE"
 )
 
 // DefaultSyncWaitCap is the built-in inline-wait ceiling: below the ~120s
@@ -101,6 +114,18 @@ const (
 	DefaultStateBudget        = int64(2) << 30 // 2 GiB
 	DefaultSessionTTL         = 7 * 24 * time.Hour
 )
+
+// MeasuredFixedModes is the whitelist of agy --mode values this build will
+// pass on the server's own authority.
+//
+// It is empty on purpose. A fixed mode is a server-side decision about what
+// agy is allowed to do, and the plan's T1 boundary note requires the value's
+// effect on tool permissions and write gating to be measured before it enters
+// a whitelist. Until that measurement exists, AGY_MCP_FIXED_MODE cannot be set
+// to anything: the empty list makes every non-empty value a startup error
+// rather than a silent pass-through. Populating it is a measured, documented
+// act, not a configuration change.
+var MeasuredFixedModes []string
 
 // HTTPGuard carries the resolved HTTP transport limits. The zero value means
 // every limit is off, which is upstream behavior; an unset limit under a
@@ -218,22 +243,14 @@ func resolvePolicy(c *Config) error {
 		p.Profile = v
 	}
 	var err error
-	if p.ForceSandbox, _, err = lookupBool(EnvForceSandbox); err != nil {
+	if err := resolvePolicySwitches(p); err != nil {
 		return err
 	}
-	if p.DisableSkipPermissions, _, err = lookupBool(EnvDisableSkipPermissions); err != nil {
-		return err
+	if raw := os.Getenv(EnvFixedMode); raw != "" {
+		p.Mode.FixedMode = raw
 	}
-	if p.InlineJSONSchemaOnly, _, err = lookupBool(EnvInlineJSONSchemaOnly); err != nil {
-		return err
-	}
-	if p.DisableContinueLatest, _, err = lookupBool(EnvDisableContinueLatest); err != nil {
-		return err
-	}
-	if p.DisableAgentSelection, _, err = lookupBool(EnvDisableAgentSelection); err != nil {
-		return err
-	}
-	if p.RequireHTTPToken, _, err = lookupBool(EnvRequireHTTPToken); err != nil {
+	p.Mode.AllowedModes = MeasuredFixedModes
+	if p.AllowedHosts, err = resolveAllowedHosts(); err != nil {
 		return err
 	}
 	if raw := os.Getenv(EnvAllowedRoots); raw != "" {
@@ -262,19 +279,9 @@ func resolvePolicy(c *Config) error {
 		}
 	}
 	if raw, ok := os.LookupEnv(EnvMaxTimeout); ok {
-		if raw == "" {
-			return fmt.Errorf("%s is set but empty; want a positive Go duration (0 < d <= 24h) or unset", EnvMaxTimeout)
-		}
-		d, perr := time.ParseDuration(raw)
-		if perr != nil {
-			return fmt.Errorf("%s %q: %w", EnvMaxTimeout, raw, perr)
-		}
-		// An explicit zero is a configuration error, not "no limit": a silent
-		// read as "unset" would re-enable the upstream 24h ceiling while the
-		// operator believes a cap is active. Ceiling (> 24h) is checked in
-		// ValidateAndNormalize below.
-		if d <= 0 {
-			return fmt.Errorf("%s %q: want a positive duration (0 < d <= 24h) or unset", EnvMaxTimeout, raw)
+		d, err := resolveMaxTimeout(raw)
+		if err != nil {
+			return err
 		}
 		p.MaxTimeout = d
 	}
@@ -293,13 +300,82 @@ func resolvePolicy(c *Config) error {
 	if c.StateBudgetBytes, err = resolveStateBudget(p); err != nil {
 		return err
 	}
+	if c.SyncWaitCap, c.SyncWaitCapSet, err = resolveSyncWaitCapStrict(); err != nil {
+		return err
+	}
 
 	if p.Protected() {
+		if err := loadProjectManifest(c); err != nil {
+			return err
+		}
 		if err := applyProfileRequirements(c); err != nil {
 			return err
 		}
 	}
 	return p.ValidateAndNormalize()
+}
+
+// resolveMaxTimeout parses AGY_MCP_MAX_TIMEOUT. An unset variable leaves the
+// zero (no cap); set-but-empty is refused like the other policy variables; an
+// explicit zero is a configuration error, not "no limit", because a silent
+// read as "unset" would re-enable the upstream 24h ceiling while the operator
+// believes a cap is active. The >24h ceiling is checked in
+// ValidateAndNormalize.
+func resolveMaxTimeout(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, fmt.Errorf("%s is set but empty; want a positive Go duration (0 < d <= 24h) or unset", EnvMaxTimeout)
+	}
+	d, perr := time.ParseDuration(raw)
+	if perr != nil {
+		return 0, fmt.Errorf("%s %q: %w", EnvMaxTimeout, raw, perr)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s %q: want a positive duration (0 < d <= 24h) or unset", EnvMaxTimeout, raw)
+	}
+	return d, nil
+}
+
+// resolvePolicySwitches reads the boolean policy switches. Each one is set-
+// or-unset with a validated value; a set-but-unparseable value is a startup
+// error rather than a silent guess, because these switches change what the
+// server enforces. Split out of resolvePolicy to keep that function's
+// complexity capped: the switches share one shape and none of them interact.
+func resolvePolicySwitches(p *policy.Policy) error {
+	var err error
+	if p.ForceSandbox, _, err = lookupBool(EnvForceSandbox); err != nil {
+		return err
+	}
+	if p.DisableSkipPermissions, _, err = lookupBool(EnvDisableSkipPermissions); err != nil {
+		return err
+	}
+	if p.InlineJSONSchemaOnly, _, err = lookupBool(EnvInlineJSONSchemaOnly); err != nil {
+		return err
+	}
+	if p.DisableContinueLatest, _, err = lookupBool(EnvDisableContinueLatest); err != nil {
+		return err
+	}
+	if p.DisableAgentSelection, _, err = lookupBool(EnvDisableAgentSelection); err != nil {
+		return err
+	}
+	if p.RequireHTTPToken, _, err = lookupBool(EnvRequireHTTPToken); err != nil {
+		return err
+	}
+	if p.Mode.DisableClientMode, _, err = lookupBool(EnvDisableMode); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resolveAllowedHosts parses AGY_MCP_HTTP_ALLOWED_HOSTS. It is split out of
+// resolvePolicy because that function's complexity is capped: each new
+// policy variable goes through the same read-and-validate shape, and keeping
+// the whitelist in its own helper keeps the main resolver readable.
+func resolveAllowedHosts() ([]string, error) {
+	raw := os.Getenv(EnvHTTPAllowedHosts)
+	if raw == "" {
+		return nil, nil
+	}
+	return splitList(EnvHTTPAllowedHosts, raw)
 }
 
 // resolveSessionTTL resolves the managed-only handle expiry. It is only
@@ -492,9 +568,107 @@ func requiredIdentity(name string) (string, error) {
 	return raw, nil
 }
 
+// loadProjectManifest reads the project manifest a protected instance
+// declares and copies its deployment-assigned values onto the policy.
+//
+// The manifest is the only source of the snapshot root the /workspace mapping
+// uses and of the project identity the ownership records carry, so a missing
+// or invalid manifest is a startup failure, never a fallback to a guessed
+// root. The state-directory overlap checks live here (rather than in
+// policy.LoadProjectManifest) because this package owns the state directory.
+func loadProjectManifest(c *Config) error {
+	p := &c.Policy
+	path := os.Getenv(EnvProjectManifest)
+	if path == "" {
+		return fmt.Errorf("%s is required under profile %s: the controlled launcher writes the project manifest before the server starts", EnvProjectManifest, policy.ProfilePi)
+	}
+	m, err := policy.LoadProjectManifest(path)
+	if err != nil {
+		return err
+	}
+	stateDir, stateErr := filepath.Abs(c.StateDir)
+	if stateErr != nil {
+		return fmt.Errorf("resolve %s %q: %w", EnvStateDir, c.StateDir, stateErr)
+	}
+	manifestDir := filepath.Dir(path)
+	if withinDir(stateDir, manifestDir) {
+		return fmt.Errorf("project manifest %s is inside the state directory %s; the manifest is deployment configuration, not job state, and keeping it out of the state dir stops the job-store budget and GC from accounting for it", path, stateDir)
+	}
+	snapshot, err := m.SnapshotRootCanonical()
+	if err != nil {
+		return fmt.Errorf("project manifest %s: %w", path, err)
+	}
+	if snapshot == stateDir || withinDir(stateDir, snapshot) || withinDir(snapshot, stateDir) {
+		return fmt.Errorf("project manifest snapshot root %s overlaps the state directory %s; the read-only snapshot and the writable job store must be separate trees", snapshot, stateDir)
+	}
+	// Optional cross-checks: when the deployment asserts an identity or a
+	// fingerprint, it must match the manifest exactly. Neither can substitute
+	// for the manifest, which is the authoritative record.
+	if c.ProjectID != "" && c.ProjectID != m.ProjectID {
+		return fmt.Errorf("%s=%q does not match the project manifest's project_id %q", EnvProjectID, c.ProjectID, m.ProjectID)
+	}
+	if asserted := os.Getenv("AGY_MCP_SNAPSHOT_FINGERPRINT"); asserted != "" && asserted != m.SnapshotFingerprint {
+		return fmt.Errorf("%s=%q does not match the project manifest's snapshot_fingerprint %q", "AGY_MCP_SNAPSHOT_FINGERPRINT", asserted, m.SnapshotFingerprint)
+	}
+	p.ProjectManifestPath = path
+	p.ProjectID = m.ProjectID
+	p.SnapshotFingerprint = m.SnapshotFingerprint
+	p.SnapshotRoot = snapshot
+	p.WorkerMount = m.WorkerMount
+	// The manifest's project identity is what the ownership records carry, so
+	// the resolved Config mirrors it rather than keeping a second spelling.
+	c.ProjectID = m.ProjectID
+	c.SnapshotFingerprint = m.SnapshotFingerprint
+	return nil
+}
+
+// withinDir reports whether path is dir itself or lies under it. Both must be
+// absolute and canonical; a lexical prefix comparison would call
+// "/state-evil" a child of "/state".
+func withinDir(dir, path string) bool {
+	if dir == path {
+		return true
+	}
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+// resolveSyncWaitCapStrict resolves AGY_MCP_SYNC_WAIT_CAP for the strict path.
+//
+// Upstream, an unset or unparseable value silently falls back to the default
+// (see ResolveSyncWaitCap), and that behavior is preserved for an unprotected
+// server. Under the pi profile the ceiling is part of the client-timeout
+// budget the plan requires to be explicit: a typo'd or missing value would
+// otherwise land on 90s, which can exceed the client's own per-call timeout
+// and lose the job_id that the still-running result carries. So the strict
+// path reports whether the variable was set and refuses anything unparseable
+// or non-positive; applyProfileRequirements turns "unset" into a startup
+// failure under the profile.
+func resolveSyncWaitCapStrict() (time.Duration, bool, error) {
+	raw, set := os.LookupEnv(EnvSyncWaitCap)
+	if !set || raw == "" {
+		return DefaultSyncWaitCap, false, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, true, fmt.Errorf("%s %q: %w", EnvSyncWaitCap, raw, err)
+	}
+	if d <= 0 {
+		return 0, true, fmt.Errorf("%s %q: want a positive Go duration", EnvSyncWaitCap, raw)
+	}
+	return d, true, nil
+}
+
 // applyProfileRequirements enforces the pi profile's fixed settings. Each
 // rule is either taken as the profile default when unset, or, when set, must
 // match the required value; a conflict refuses the start.
+//
+// The rules that need the state directory (its permissions) run after the
+// directory itself has been checked for presence below, because a stat on a
+// missing path reports nothing useful.
 func applyProfileRequirements(c *Config) error {
 	p := &c.Policy
 	boolRules := []profileRule{
@@ -503,6 +677,7 @@ func applyProfileRequirements(c *Config) error {
 		{EnvInlineJSONSchemaOnly, false}, // json_schema is refused wholesale; the knob does not apply
 		{EnvDisableContinueLatest, true},
 		{EnvRequireHTTPToken, true},
+		{EnvDisableMode, true},
 	}
 	for _, rule := range boolRules {
 		v, set, err := lookupBool(rule.name)
@@ -526,7 +701,36 @@ func applyProfileRequirements(c *Config) error {
 			p.DisableContinueLatest = v
 		case EnvRequireHTTPToken:
 			p.RequireHTTPToken = v
+		case EnvDisableMode:
+			p.Mode.DisableClientMode = v
 		}
+	}
+	if len(p.AllowedHosts) == 0 {
+		return fmt.Errorf("%s is required under profile %s: name the published endpoint and this instance's own listen address", EnvHTTPAllowedHosts, policy.ProfilePi)
+	}
+	// Agent selection is off by default under the profile: an agent name is a
+	// host-side concept a caller cannot be trusted to pick, and the reserved
+	// names agy accepts make a "none" sentinel ambiguous. Opening it is a
+	// deliberate act that must name the whitelist at the same time, so an
+	// explicit opt-out without a whitelist is refused rather than silently
+	// exposing every host-configured agent name.
+	agentOff, set, err := lookupBool(EnvDisableAgentSelection)
+	if err != nil {
+		return err
+	}
+	if !set {
+		agentOff = true
+	}
+	p.DisableAgentSelection = agentOff
+	if !agentOff && len(p.AllowedAgents) == 0 {
+		return fmt.Errorf("%s is off under profile %s, so %s must name the agents a caller may select", EnvDisableAgentSelection, policy.ProfilePi, EnvAllowedAgents)
+	}
+	// The inline-wait ceiling is part of the client-timeout budget, so under the
+	// profile it must be stated rather than defaulted: an omitted or typo'd value
+	// would silently land on 90s, which can outlast the client's own per-call
+	// timeout and lose the job_id the still-running result carries.
+	if !c.SyncWaitCapSet {
+		return fmt.Errorf("%s is required under profile %s: set the inline-wait ceiling explicitly (for example 50s) so the client-timeout budget is a stated number", EnvSyncWaitCap, policy.ProfilePi)
 	}
 	if len(p.AllowedRoots) == 0 {
 		return fmt.Errorf("%s is required under profile %s: name the single project root", EnvAllowedRoots, policy.ProfilePi)
@@ -656,6 +860,14 @@ func verifyDeploymentRecord(c *Config) error {
 	}
 	if rec.SnapshotFingerprint == "" {
 		return fmt.Errorf("deployment record carries no snapshot fingerprint; redeploy the instance so ownership and replays bind to a snapshot version")
+	}
+	// The manifest and the deployment record are two records of the same
+	// snapshot version, written by the same launcher run. When they disagree the
+	// deployment is half-configured (a stale record, a manifest from another
+	// snapshot), and picking one over the other would silently rebind ownership
+	// and idempotent replay to a version this instance does not actually serve.
+	if c.Policy.SnapshotFingerprint != "" && c.Policy.SnapshotFingerprint != rec.SnapshotFingerprint {
+		return fmt.Errorf("deployment record snapshot fingerprint %s does not match the project manifest's %s; redeploy the instance so both name the same snapshot version", rec.SnapshotFingerprint, c.Policy.SnapshotFingerprint)
 	}
 	c.SnapshotFingerprint = rec.SnapshotFingerprint
 	return nil

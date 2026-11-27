@@ -45,14 +45,44 @@ func TestValidateAndNormalizeRejectsUnknownProfile(t *testing.T) {
 	}
 }
 
+// protectedPolicy builds a valid pi-profile policy rooted at the given host
+// directory. It is the shape internal/config produces after loading a project
+// manifest: the worker mount is fixed, the only allowed root is the mount, and
+// the manifest supplies the host snapshot root the mount maps onto.
+func protectedPolicy(t *testing.T, snapshot string) Policy {
+	t.Helper()
+	return Policy{
+		Profile:             ProfilePi,
+		AllowedRoots:        []string{WorkerMountPath},
+		DefaultCwd:          WorkerMountPath,
+		WorkerMount:         WorkerMountPath,
+		SnapshotRoot:        mustResolve(t, snapshot),
+		SnapshotFingerprint: "sha256:" + strings.Repeat("a", 64),
+		SessionPolicy:       SessionPolicyDisabled,
+		ForceSandbox:        true,
+		DisableJSONSchema:   true,
+		Mode:                ModePolicy{DisableClientMode: true},
+		AllowedHosts:        []string{"127.0.0.8:8765"},
+		MaxTimeout:          20 * time.Minute,
+		RequireHTTPToken:    true,
+	}
+}
+
 func TestValidateAndNormalizeAcceptsPiProfile(t *testing.T) {
 	root := dir(t)
-	p := Policy{Profile: ProfilePi, AllowedRoots: []string{root}}
+	p := protectedPolicy(t, root)
 	if err := p.ValidateAndNormalize(); err != nil {
 		t.Fatalf("pi profile rejected: %v", err)
 	}
 	if !p.Protected() {
 		t.Fatal("Protected() false after profile pi validated")
+	}
+	// The snapshot root is canonicalized, and the mount stays the only root.
+	if p.SnapshotRoot != mustResolve(t, root) {
+		t.Fatalf("snapshot root %q, want canonical %q", p.SnapshotRoot, mustResolve(t, root))
+	}
+	if len(p.AllowedRoots) != 1 || p.AllowedRoots[0] != WorkerMountPath {
+		t.Fatalf("allowed roots %q, want only %s", p.AllowedRoots, WorkerMountPath)
 	}
 }
 

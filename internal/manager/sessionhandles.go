@@ -192,17 +192,27 @@ func (m *Manager) gcExpiredSessions() {
 }
 
 // enforceStateBudget evicts the store's oldest removable terminal jobs until
-// the job store fits the configured disk budget. It is the disk half of the
+// the job store sits below the eviction target. It is the disk half of the
 // protected deployment's resource bounds: output caps bound one job, the
 // budget bounds their sum. Jobs a live supervisor still owns, jobs that are
 // not terminal, and jobs whose ownership does not match this instance are
-// never evicted; when nothing removable fits the budget the overrun is
+// never evicted; when nothing removable fits the target the overrun is
 // logged and left for the next sweep rather than deleting something live.
+//
+// The target is below the budget rather than at it, because the acceptance
+// criterion (docs/pi-sandbox-hardening.md section 5.D) is that a sweep leaves
+// the store under 90% of the budget. Evicting only until "just under the
+// budget" would satisfy the letter of the bound while leaving a store one
+// fresh job away from breaching it again, and a flood drill measuring the
+// post-cleanup occupancy would fail. The margin is not wasted storage: it is
+// the headroom that keeps the next job's output from immediately re-triggering
+// an eviction.
 //
 // The size walk is one stat pass per job dir; it runs on GC sweeps only, not
 // on any request path.
 func (m *Manager) enforceStateBudget() {
-	if m.cfg.StateBudgetBytes <= 0 {
+	budget := m.cfg.StateBudgetBytes
+	if budget <= 0 {
 		return
 	}
 	ids, err := m.store.List()
@@ -242,13 +252,14 @@ func (m *Manager) enforceStateBudget() {
 		at, atOK := m.store.CompletedAt(id)
 		removable = append(removable, budgetCandidate{id: id, size: size, at: at, atOK: atOK, startedAt: meta.StartedAt})
 	}
-	if total <= m.cfg.StateBudgetBytes {
+	target := stateBudgetEvictTarget(budget)
+	if total <= target {
 		return
 	}
 	// Oldest completion first; jobs with no computable completion time sort
 	// last so an unknown age never wins the eviction race against a known one.
 	sortCandidatesByAge(removable)
-	over := total - m.cfg.StateBudgetBytes
+	over := total - target
 	for _, c := range removable {
 		if over <= 0 {
 			break
@@ -258,11 +269,22 @@ func (m *Manager) enforceStateBudget() {
 			continue
 		}
 		over -= c.size
-		log.Printf("state budget: evicted job %s (%d bytes) to fit the %d byte budget", c.id, c.size, m.cfg.StateBudgetBytes)
+		log.Printf("state budget: evicted job %s (%d bytes) to bring the store under the %d byte eviction target (%d byte budget)", c.id, c.size, target, budget)
 	}
 	if over > 0 {
-		log.Printf("state budget: store is %d bytes over budget with nothing removable; running jobs hold the rest", over)
+		log.Printf("state budget: store is %d bytes over the eviction target with nothing removable; running jobs hold the rest", over)
 	}
+}
+
+// stateBudgetEvictTargetPercent is the share of the budget a sweep aims to
+// leave the store under. See enforceStateBudget for why this is below 100.
+const stateBudgetEvictTargetPercent = 90
+
+// stateBudgetEvictTarget returns the occupancy a sweep evicts toward: 90% of
+// the budget, computed in integer arithmetic so the comparison is exact and
+// does not drift with floating point.
+func stateBudgetEvictTarget(budget int64) int64 {
+	return budget * stateBudgetEvictTargetPercent / 100
 }
 
 // dirSize returns the total size of a directory tree's regular files. A walk

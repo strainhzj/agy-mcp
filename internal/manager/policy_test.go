@@ -16,13 +16,27 @@ import (
 	"github.com/tphakala/agy-mcp/v2/internal/proc"
 )
 
-// policyRoot returns an existing canonical directory for use as the single
-// allowed root, plus a second directory outside it.
+// policyRoot returns an existing canonical directory to serve as the
+// protected instance's host-side snapshot root, plus a second directory
+// outside it. Callers spell caller-visible paths with wpath: under the pi
+// profile the only allowed root is the worker mount, and the snapshot root is
+// what that mount maps onto on the host.
 func policyRoot(t *testing.T) (root, outside string) {
 	t.Helper()
 	root = canonicalDir(t, t.TempDir())
 	outside = canonicalDir(t, t.TempDir())
 	return root, outside
+}
+
+// wpath spells a host path under root in the worker view the pi profile
+// exposes, which is what a caller passes and what the policy writes back.
+func wpath(t *testing.T, root, host string) string {
+	t.Helper()
+	rel, err := filepath.Rel(root, host)
+	if err != nil {
+		t.Fatalf("rel %s under %s: %v", host, root, err)
+	}
+	return filepath.Join(policy.WorkerMountPath, rel)
 }
 
 func canonicalDir(t *testing.T, p string) string {
@@ -38,17 +52,37 @@ func canonicalDir(t *testing.T, p string) string {
 	return abs
 }
 
-// restrictedPol is the protected single-root policy the manager tests use.
+// restrictedPol is the protected single-project policy the manager tests
+// use. It is the shape internal/config resolves for the pi profile: the worker
+// mount is the only allowed root, and the manifest's snapshot root is what
+// that mount maps onto on the host.
+//
 // SessionPolicy is disabled explicitly because that is what the pi profile
 // resolves to: a hand-built Policy with an empty SessionPolicy means allow,
 // and these tests exercise the protected behavior, not the zero value.
 func restrictedPol(root string) policy.Policy {
 	return policy.Policy{
-		Profile:       policy.ProfilePi,
-		AllowedRoots:  []string{root},
-		DefaultCwd:    root,
-		SessionPolicy: policy.SessionPolicyDisabled,
-		ForceSandbox:  true,
+		Profile:             policy.ProfilePi,
+		AllowedRoots:        []string{"/workspace"},
+		DefaultCwd:          "/workspace",
+		WorkerMount:         "/workspace",
+		SnapshotRoot:        root,
+		SnapshotFingerprint: "sha256:" + strings.Repeat("a", 64),
+		SessionPolicy:       policy.SessionPolicyDisabled,
+		ForceSandbox:        true,
+		DisableJSONSchema:   true,
+		Mode:                policy.ModePolicy{DisableClientMode: true},
+		// Agent selection is off by default under the profile (config's
+		// applyProfileRequirements sets it when the variable is unset), so the
+		// hand-built fixture must say so explicitly: a Policy built here bypasses
+		// config, and a fixture that left it false would exercise a shape no real
+		// deployment resolves to.
+		DisableAgentSelection: true,
+		AllowedHosts:          []string{"127.0.0.8:8765"},
+		MaxTimeout:            24 * time.Hour,
+		RequireHTTPToken:      true,
+		ProjectID:             "proj-1",
+		InstanceID:            "inst-1",
 	}
 }
 
@@ -68,12 +102,12 @@ func TestNormalizeRequestRestrictedPaths(t *testing.T) {
 	base := StartRequest{Prompt: "p", Timeout: time.Minute}
 
 	t.Run("inside canonicalized", func(t *testing.T) {
-		req, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: sub, Timeout: time.Minute})
+		req, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: wpath(t, root, sub), Timeout: time.Minute})
 		if err != nil {
 			t.Fatalf("inside cwd refused: %v", err)
 		}
-		if req.Cwd != sub {
-			t.Fatalf("cwd %q, want canonical %q", req.Cwd, sub)
+		if req.Cwd != wpath(t, root, sub) {
+			t.Fatalf("cwd %q, want worker-view %q", req.Cwd, wpath(t, root, sub))
 		}
 	})
 	t.Run("empty resolves to default cwd", func(t *testing.T) {
@@ -81,8 +115,8 @@ func TestNormalizeRequestRestrictedPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("empty cwd refused: %v", err)
 		}
-		if req.Cwd != root {
-			t.Fatalf("cwd %q, want default %q", req.Cwd, root)
+		if req.Cwd != "/workspace" {
+			t.Fatalf("cwd %q, want the worker mount /workspace", req.Cwd)
 		}
 	})
 	t.Run("empty without default refused", func(t *testing.T) {
@@ -97,33 +131,36 @@ func TestNormalizeRequestRestrictedPaths(t *testing.T) {
 		}
 	})
 	t.Run("outside refused", func(t *testing.T) {
+		// outside is a host directory outside the snapshot; in the worker view
+		// there is no path that names it.
 		if _, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: outside, Timeout: time.Minute}); err == nil {
 			t.Fatal("outside cwd accepted")
 		}
 	})
 	t.Run("sibling prefix refused", func(t *testing.T) {
-		if _, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: sibling, Timeout: time.Minute}); err == nil {
+		if _, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: "/workspace-evil", Timeout: time.Minute}); err == nil {
 			t.Fatal("sibling-prefix cwd accepted")
 		}
 	})
 	t.Run("traversal refused", func(t *testing.T) {
-		if _, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: root + "/..", Timeout: time.Minute}); err == nil {
+		if _, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: "/workspace/..", Timeout: time.Minute}); err == nil {
 			t.Fatal("parent traversal cwd accepted")
 		}
 	})
 	t.Run("escaping dirs refused whole", func(t *testing.T) {
-		if _, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: sub, Dirs: []string{sub, "../outside"}, Timeout: time.Minute}); err == nil {
+		if _, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: wpath(t, root, sub), Dirs: []string{wpath(t, root, sub), "../outside"}, Timeout: time.Minute}); err == nil {
 			t.Fatal("dirs with an escaping entry accepted")
 		}
 	})
 	t.Run("valid dirs normalized", func(t *testing.T) {
-		// ".." from sub resolves to the root itself: inside, and canonical.
-		req, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: sub, Dirs: []string{".."}, Timeout: time.Minute})
+		// ".." from sub resolves to the snapshot root: inside, and the worker
+		// view of it.
+		req, err := m.normalizeRequest(StartRequest{Prompt: "p", Cwd: wpath(t, root, sub), Dirs: []string{".."}, Timeout: time.Minute})
 		if err != nil {
 			t.Fatalf("valid dirs refused: %v", err)
 		}
-		if !slices.Equal(req.Dirs, []string{root}) {
-			t.Fatalf("dirs %q, want [%q]", req.Dirs, root)
+		if !slices.Equal(req.Dirs, []string{"/workspace"}) {
+			t.Fatalf("dirs %q, want [/workspace]", req.Dirs)
 		}
 	})
 }
@@ -434,6 +471,82 @@ func TestProtectedScopeReplaySkipsForeignJob(t *testing.T) {
 	_, _, err = m.findIdempotentJob(other, buildAgyArgs(other), true)
 	if err == nil || !strings.Contains(err.Error(), "j") {
 		t.Fatalf("own mismatch = %v, want a refusal naming our own job j", err)
+	}
+}
+
+// TestProtectedScopeOwnershipFourFieldsMatch pins the acceptance criterion
+// that a tampered ownership record is refused on ANY of its four fields, not
+// just the ones an earlier build compared. Each subtest changes exactly one
+// field and asserts the same indistinguishable unknown-job error from both the
+// caller-facing gate (ownershipRefused) and Status, and that the foreign job's
+// state is left untouched. Removing the profile comparison from
+// ownershipMatches turns its subtest red; removing any other field turns that
+// field's subtest red.
+func TestProtectedScopeOwnershipFourFieldsMatch(t *testing.T) {
+	if !proc.Supported {
+		t.Skip("job supervision unsupported on this platform")
+	}
+	const (
+		project  = "proj-1"
+		instance = "inst-1"
+	)
+	// A fingerprint is a runtime value, not a constant: it is built the same way
+	// the policy fixtures build theirs.
+	goodFP := "sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name   string
+		mutate func(own *jobOwnership)
+	}{
+		{"profile", func(o *jobOwnership) { o.Profile = "default" }},
+		{"profile emptied", func(o *jobOwnership) { o.Profile = "" }},
+		{"project", func(o *jobOwnership) { o.ProjectID = "other-project" }},
+		{"instance", func(o *jobOwnership) { o.InstanceID = "other-instance" }},
+		{"snapshot fingerprint", func(o *jobOwnership) { o.SnapshotFingerprint = "sha256:" + strings.Repeat("b", 64) }},
+		{"snapshot fingerprint emptied", func(o *jobOwnership) { o.SnapshotFingerprint = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, _ := policyRoot(t)
+			m := newManager(t, managerOpts{
+				pol: restrictedPol(root), projectID: project, instanceID: instance,
+				snapshotFingerprint: goodFP,
+			})
+			dir, err := m.store.Create(jobstore.Meta{ID: "j", StartedAt: time.Now(), BootID: readBootID()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeOwnershipFingerprint(t, dir, project, instance, goodFP)
+			b, err := os.ReadFile(jobstore.OwnershipPath(dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var own jobOwnership
+			if err := json.Unmarshal(b, &own); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(&own)
+			b, err = json.Marshal(own)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := jobstore.WriteOwnershipFile(dir, b); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := m.ownershipRefused("j"); err == nil {
+				t.Errorf("ownershipRefused accepted a record with only %s changed", tc.name)
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("ownershipRefused error = %v, want the indistinguishable unknown-job error", err)
+			}
+			if _, err := m.Status("j"); err == nil {
+				t.Errorf("Status accepted a job whose ownership %s was tampered", tc.name)
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("Status error = %v, want the indistinguishable unknown-job error", err)
+			}
+			// The refusal must not touch the foreign job's state.
+			if _, done := m.store.ExitCode("j"); done {
+				t.Error("refused job gained an exit-code sentinel")
+			}
+		})
 	}
 }
 

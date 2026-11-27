@@ -65,6 +65,56 @@ const MaxInlineJSONSchemaBytes = 64 << 10 // 64 KiB
 // mcptools enforces (its maxJobTimeout), so both boundaries move together.
 const MaxTimeoutCeiling = 24 * time.Hour
 
+// ModePolicy is the policy for the mode parameter and agy's --mode flag.
+//
+// The mode parameter is untrusted input: it reaches the CLI verbatim when it
+// is accepted, and a mode that changes what agy is allowed to do is exactly
+// the kind of knob a confused deputy must not hold. So the default is that a
+// protected server removes the field from its schema and refuses any request
+// carrying the key at all (an empty string, null, or a non-string all
+// included), and the server alone decides whether --mode is passed.
+type ModePolicy struct {
+	// DisableClientMode removes the mode field from the tool schema and
+	// refuses any request carrying the key. AGY_MCP_DISABLE_MODE.
+	DisableClientMode bool
+	// FixedMode is the value the server passes as --mode, when it passes one
+	// at all. Empty means no --mode flag. A non-empty value must appear in
+	// AllowedModes.
+	FixedMode string
+	// AllowedModes is the static whitelist FixedMode is checked against. It is
+	// deliberately empty until the agy behavior a mode selects has been
+	// measured (see the plan's T1 boundary note): a mode that changes tool
+	// permissions or write gating is a security-relevant claim, and an
+	// unmeasured value must not enter the whitelist.
+	AllowedModes []string
+}
+
+// FixedModeArg returns the --mode flag pair the server should pass, or nil
+// when it passes none. It is the single place that decides, so a caller's mode
+// value can never reach the CLI: buildAgyArgs takes the pair from here, not
+// from the request.
+func (m ModePolicy) FixedModeArg() []string {
+	if m.FixedMode == "" {
+		return nil
+	}
+	return []string{"--mode", m.FixedMode}
+}
+
+// Validate checks the mode policy: a fixed mode must be whitelisted, and a
+// whitelisted value must be one this build was told about.
+func (m ModePolicy) Validate() error {
+	if m.FixedMode == "" {
+		return nil
+	}
+	if len(m.AllowedModes) == 0 {
+		return fmt.Errorf("fixed mode %q is not allowed: the whitelist of measured modes is empty, so no fixed mode can be configured until the mode's effect on tool permissions and write gating has been measured", m.FixedMode)
+	}
+	if !slices.Contains(m.AllowedModes, m.FixedMode) {
+		return fmt.Errorf("fixed mode %q is not in the whitelist (%s)", m.FixedMode, strings.Join(m.AllowedModes, ", "))
+	}
+	return nil
+}
+
 // Policy is the resolved deployment policy. Fields are documented with the
 // environment variable that feeds them in internal/config.
 type Policy struct {
@@ -120,6 +170,44 @@ type Policy struct {
 	// RequireHTTPToken refuses an HTTP start with no bearer token configured.
 	// AGY_MCP_REQUIRE_HTTP_TOKEN.
 	RequireHTTPToken bool
+
+	// Mode is the mode-parameter policy; see the ModePolicy type. AGY_MCP_DISABLE_MODE
+	// and AGY_MCP_FIXED_MODE.
+	Mode ModePolicy
+
+	// ProjectManifestPath is the absolute path of the project manifest a
+	// protected instance loads (AGY_MCP_PROJECT_MANIFEST). It is required under
+	// the pi profile and ignored otherwise.
+	ProjectManifestPath string
+	// ProjectID is the manifest's project identity. Under the profile it must
+	// equal AGY_MCP_PROJECT_ID when that is set, and it is what every job's
+	// ownership record carries.
+	ProjectID string
+	// InstanceID is the deployment-assigned instance identity
+	// (AGY_MCP_INSTANCE_ID), written into every ownership record.
+	InstanceID string
+	// SnapshotFingerprint is the manifest's snapshot fingerprint. Under the
+	// profile it must equal AGY_MCP_SNAPSHOT_FINGERPRINT when that is set, and
+	// it binds ownership and idempotent replay to one snapshot version.
+	SnapshotFingerprint string
+	// SnapshotRoot is the manifest's snapshot root, canonicalized (Abs plus
+	// EvalSymlinks). It is the host side of the WorkerMount mapping: the
+	// control plane runs in the host view, where no /workspace mount exists,
+	// so it validates a caller's /workspace/... path against this directory.
+	SnapshotRoot string
+	// WorkerMount is the neutral worker-view mount point. It is fixed at
+	// WorkerMountPath by the profile; a non-profile policy leaves it empty and
+	// performs no mapping.
+	WorkerMount string
+	// DisableJSONSchema refuses every non-empty json_schema, including a valid
+	// inline object. The pi profile sets it; other deployments use
+	// InlineJSONSchemaOnly for the softer rule.
+	DisableJSONSchema bool
+	// AllowedHosts is the HTTP Host header allowlist a protected instance
+	// enforces (AGY_MCP_HTTP_ALLOWED_HOSTS). It must name the published
+	// endpoint and the instance's own listen address. Empty means no Host
+	// restriction, which the pi profile refuses at startup.
+	AllowedHosts []string
 }
 
 // Restricted reports whether the policy constrains request paths at all. It
@@ -153,15 +241,21 @@ func (p *Policy) ValidateAndNormalize() error {
 	default:
 		return fmt.Errorf("unknown profile %q: want %q or unset", p.Profile, ProfilePi)
 	}
-	roots := make([]string, 0, len(p.AllowedRoots))
-	for _, root := range p.AllowedRoots {
-		resolved, err := resolveExistingDir(root)
-		if err != nil {
-			return fmt.Errorf("allowed root %q: %w", root, err)
+	if p.Protected() {
+		if err := p.normalizeProtected(); err != nil {
+			return err
 		}
-		roots = append(roots, resolved)
+	} else {
+		roots := make([]string, 0, len(p.AllowedRoots))
+		for _, root := range p.AllowedRoots {
+			resolved, err := resolveExistingDir(root)
+			if err != nil {
+				return fmt.Errorf("allowed root %q: %w", root, err)
+			}
+			roots = append(roots, resolved)
+		}
+		p.AllowedRoots = roots
 	}
-	p.AllowedRoots = roots
 	if p.DefaultCwd != "" {
 		cwd, err := p.CheckDir(p.DefaultCwd)
 		if err != nil {
@@ -196,7 +290,123 @@ func (p *Policy) ValidateAndNormalize() error {
 	if p.MaxTimeout > MaxTimeoutCeiling {
 		return fmt.Errorf("max timeout %s exceeds the %s ceiling", p.MaxTimeout, MaxTimeoutCeiling)
 	}
+	if err := p.Mode.Validate(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// normalizeProtected is the pi-profile half of ValidateAndNormalize.
+//
+// The protected profile's caller-visible paths are worker-view paths
+// (/workspace/...), and the host has no such mount: the control plane runs in
+// the host view. So AllowedRoots is not resolved against the host filesystem
+// (that would fail on a host where no /workspace exists) and is instead
+// pinned to the manifest's WorkerMount; the host-side existence and symlink
+// checks apply to the manifest's SnapshotRoot, which is what a /workspace
+// path maps to.
+func (p *Policy) normalizeProtected() error {
+	if p.WorkerMount == "" {
+		p.WorkerMount = WorkerMountPath
+	}
+	if p.WorkerMount != WorkerMountPath {
+		return fmt.Errorf("worker mount %q: the protected profile fixes it at %s", p.WorkerMount, WorkerMountPath)
+	}
+	if p.SnapshotRoot == "" {
+		return fmt.Errorf("profile %s requires the project manifest's snapshot root; the manifest is what maps %s onto the host snapshot", ProfilePi, WorkerMountPath)
+	}
+	resolved, err := resolveExistingDir(p.SnapshotRoot)
+	if err != nil {
+		return fmt.Errorf("snapshot root %q from the project manifest: %w", p.SnapshotRoot, err)
+	}
+	p.SnapshotRoot = resolved
+	if len(p.AllowedRoots) == 0 {
+		return fmt.Errorf("%s is required under profile %s: the single project root is %s", "AGY_MCP_ALLOWED_ROOTS", ProfilePi, WorkerMountPath)
+	}
+	for _, root := range p.AllowedRoots {
+		if root != WorkerMountPath {
+			return fmt.Errorf("allowed root %q: under profile %s every caller-visible path is a %s path mapped to the manifest's snapshot root, so the only allowed root is %s", root, ProfilePi, WorkerMountPath, WorkerMountPath)
+		}
+	}
+	if len(p.AllowedHosts) == 0 {
+		return fmt.Errorf("%s is required under profile %s: name the published endpoint and this instance's listen address", "AGY_MCP_HTTP_ALLOWED_HOSTS", ProfilePi)
+	}
+	for _, host := range p.AllowedHosts {
+		if err := validateHostEntry(host); err != nil {
+			return err
+		}
+	}
+	if !p.Mode.DisableClientMode {
+		return fmt.Errorf("%s must be true under profile %s: the mode parameter is untrusted input that reaches agy's --mode flag verbatim", "AGY_MCP_DISABLE_MODE", ProfilePi)
+	}
+	if !p.DisableJSONSchema {
+		p.DisableJSONSchema = true
+	}
+	return nil
+}
+
+// validateHostEntry checks one AGY_MCP_HTTP_ALLOWED_HOSTS entry. An entry
+// names a host, optionally with a port; anything else (a scheme, a path, a
+// wildcard, whitespace) is refused, because the allowlist is compared against
+// the Host header and a sloppy entry would either never match or match more
+// than intended.
+func validateHostEntry(host string) error {
+	if host == "" {
+		return fmt.Errorf("%s contains an empty entry", "AGY_MCP_HTTP_ALLOWED_HOSTS")
+	}
+	if strings.ContainsAny(host, " \t/") {
+		return fmt.Errorf("allowed host %q: want host[:port] with no scheme, path or whitespace", host)
+	}
+	if strings.Contains(host, "*") {
+		return fmt.Errorf("allowed host %q: wildcards are not accepted; name every endpoint explicitly", host)
+	}
+	return nil
+}
+
+// HostAllowed reports whether an HTTP Host header value is acceptable. An
+// empty allowlist accepts anything, which is the unrestricted upstream
+// behavior; the protected profile refuses to start without one, so in practice
+// a protected server always has a non-empty list.
+func (p Policy) HostAllowed(hostHeader string) bool {
+	return p.hostAllowed(hostHeader)
+}
+
+// hostAllowed reports whether the Host header value is on the allowlist. The
+// comparison is case-insensitive on the host part (DNS names are
+// case-insensitive) and exact on the port. An entry that names no port matches
+// that host on any port, which is what an operator means by "this host,
+// whichever port the client reached it on"; an entry that names a port matches
+// only that port, so a portless header (which means the default port, a
+// different endpoint) does not pass on it.
+func (p Policy) hostAllowed(hostHeader string) bool {
+	if len(p.AllowedHosts) == 0 {
+		return true
+	}
+	gotHost, gotPort := splitHostPort(hostHeader)
+	for _, entry := range p.AllowedHosts {
+		wantHost, wantPort := splitHostPort(entry)
+		if !strings.EqualFold(gotHost, wantHost) {
+			continue
+		}
+		if wantPort == "" || wantPort == gotPort {
+			return true
+		}
+	}
+	return false
+}
+
+// splitHostPort splits a host[:port] value. A missing port returns an empty
+// port rather than an error, and an IPv6 literal keeps its brackets, so
+// "[::1]:22" splits into "[::1]" and "22".
+func splitHostPort(value string) (host, port string) {
+	if i := strings.LastIndex(value, ":"); i >= 0 && !strings.Contains(value[i+1:], "]") {
+		// Only treat the last colon as a port separator when what follows
+		// looks like one: a bare IPv6 literal has several colons and no port.
+		if !strings.Contains(value[:i], "]") || strings.Contains(value, "]:") {
+			return value[:i], value[i+1:]
+		}
+	}
+	return value, ""
 }
 
 // resolveExistingDir canonicalizes an absolute raw path (EvalSymlinks first,
@@ -250,6 +460,13 @@ func resolveExistingDir(raw string) (string, error) {
 //   - the resolved path must be inside at least one root, compared with
 //     filepath.Rel so a sibling named "<root>-evil" cannot pass on a shared
 //     string prefix.
+//
+// Under the protected profile the caller-visible paths are worker-view paths
+// (/workspace/...) and the host has no such mount, so the raw path is first
+// mapped onto the manifest's snapshot root (see mapWorkerPath) and the
+// containment root is that snapshot root. The value written back is the
+// worker-view path, so meta.json, the request key and agy's --add-dir all
+// carry the neutral spelling rather than a host path.
 func (p Policy) CheckDir(raw string) (string, error) {
 	if len(p.AllowedRoots) == 0 {
 		return "", nil
@@ -260,6 +477,9 @@ func (p Policy) CheckDir(raw string) (string, error) {
 		}
 		return "", fmt.Errorf("cwd is required: no default working directory is configured on this server")
 	}
+	if p.Protected() {
+		return p.checkWorkerPath(raw)
+	}
 	resolved, err := resolveExistingDir(raw)
 	if err != nil {
 		return "", fmt.Errorf("resolve cwd %q: %w", raw, err)
@@ -268,6 +488,87 @@ func (p Policy) CheckDir(raw string) (string, error) {
 		return "", fmt.Errorf("cwd %q resolves to %s, outside the directories this server allows", raw, resolved)
 	}
 	return resolved, nil
+}
+
+// workerView reports whether this policy maps caller-visible paths onto the
+// host snapshot. It is true only for a protected policy whose manifest
+// supplied a snapshot root; the check is defensive, because
+// ValidateAndNormalize already refuses a protected policy without one.
+func (p Policy) workerView() bool {
+	return p.Protected() && p.SnapshotRoot != ""
+}
+
+// checkWorkerPath validates one worker-view path (/workspace/...) and returns
+// the worker-view path to persist.
+//
+// The mapping is the security-relevant part: filepath.Join and filepath.Clean
+// fold ".." lexically, so mapping with Join would collapse
+// "/workspace/link-to-etc/.." into the snapshot root before any symlink was
+// resolved, which is precisely the escape the symlink-first rule exists to
+// catch. joinAsWritten concatenates without cleaning, so the kernel resolves
+// ".." from the link's target and EvalSymlinks sees the real path.
+func (p Policy) checkWorkerPath(raw string) (string, error) {
+	host, ok := p.mapWorkerPath(raw)
+	if !ok {
+		return "", fmt.Errorf("cwd %q is not inside the worker mount %s", raw, p.WorkerMount)
+	}
+	resolved, err := resolveExistingDir(host)
+	if err != nil {
+		return "", fmt.Errorf("resolve cwd %q: %w", raw, err)
+	}
+	if !p.containedInSnapshot(resolved) {
+		return "", fmt.Errorf("cwd %q resolves outside the project snapshot this server serves", raw)
+	}
+	return p.workerViewPath(resolved)
+}
+
+// mapWorkerPath maps a worker-view path onto the host path it names. It
+// returns false for anything that is not the mount itself or a path segment
+// under it, so an adjacent prefix like "/workspace-evil" is refused rather
+// than treated as a subdirectory.
+func (p Policy) mapWorkerPath(raw string) (string, bool) {
+	mount := p.WorkerMount
+	if mount == "" {
+		mount = WorkerMountPath
+	}
+	if raw == mount {
+		return p.SnapshotRoot, true
+	}
+	if !strings.HasPrefix(raw, mount+"/") {
+		return "", false
+	}
+	return joinAsWritten(p.SnapshotRoot, raw[len(mount):]), true
+}
+
+// containedInSnapshot reports whether a host path lies under the snapshot
+// root. filepath.Rel is what makes a sibling named "<root>-evil" fail.
+func (p Policy) containedInSnapshot(abs string) bool {
+	rel, err := filepath.Rel(p.SnapshotRoot, abs)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return !filepath.IsAbs(rel)
+}
+
+// workerViewPath maps a host path back into the worker view. It is the
+// inverse of mapWorkerPath, applied to an already-resolved (symlink-free,
+// ".."-free) host path, so filepath.Join is safe here: the input cannot
+// smuggle a traversal past it.
+func (p Policy) workerViewPath(host string) (string, error) {
+	rel, err := filepath.Rel(p.SnapshotRoot, host)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." {
+		return p.WorkerMount, nil
+	}
+	return filepath.Join(p.WorkerMount, rel), nil
 }
 
 // contained reports whether abs is one of the allowed roots or lies under
@@ -305,6 +606,11 @@ func (p Policy) contained(abs string) bool {
 // a relative entry is joined against the already-checked cwd as written, so
 // ".." is resolved by the filesystem and cannot be folded past a symlink.
 // Every entry must resolve to a directory inside the roots.
+//
+// Under the protected profile the same worker-view mapping applies as in
+// CheckDir: an absolute entry is a /workspace/... path, a relative one is
+// joined to the (worker-view) cwd as written, and the values written back are
+// worker-view paths.
 func (p Policy) CheckExtraDirs(cwd string, dirs []string) ([]string, error) {
 	if len(p.AllowedRoots) == 0 {
 		return dirs, nil
@@ -323,6 +629,14 @@ func (p Policy) CheckExtraDirs(cwd string, dirs []string) ([]string, error) {
 				return nil, fmt.Errorf("dirs entry %q is relative but no cwd was accepted", d)
 			}
 			raw = joinAsWritten(cwd, d)
+		}
+		if p.workerView() {
+			resolved, err := p.checkWorkerPath(raw)
+			if err != nil {
+				return nil, fmt.Errorf("dirs entry %q: %w", d, err)
+			}
+			out = append(out, resolved)
+			continue
 		}
 		resolved, err := resolveExistingDir(raw)
 		if err != nil {
@@ -347,10 +661,20 @@ func (p Policy) CheckExtraDirs(cwd string, dirs []string) ([]string, error) {
 // that is not an inline object closes that hole without claiming anything
 // about what a schema may reference at run time. Whitespace around the object
 // is trimmed and the trimmed form is returned, so the caller's value and the
-// persisted request agree byte for byte. A protected profile refuses
-// json_schema entirely upstream of this check.
+// persisted request agree byte for byte.
+//
+// DisableJSONSchema (the protected profile) refuses every non-empty value
+// before the inline check ever runs, including a valid inline object: a
+// protected deployment does not need schemas, and the stricter reading keeps
+// the two modes from being confused for one another.
 func (p Policy) CheckJSONSchema(raw string) (string, error) {
-	if raw == "" || !p.InlineJSONSchemaOnly {
+	if raw == "" {
+		return raw, nil
+	}
+	if p.DisableJSONSchema {
+		return "", fmt.Errorf("json_schema is not accepted by this server; describe the expected output shape in the prompt instead")
+	}
+	if !p.InlineJSONSchemaOnly {
 		return raw, nil
 	}
 	trimmed := strings.TrimSpace(raw)

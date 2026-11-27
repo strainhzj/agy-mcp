@@ -49,7 +49,7 @@ func TestStartJobProtectedWritesOwnership(t *testing.T) {
 		supervisorExe:  testutil.WriteFakeSupervisor(t, testutil.FakeSupervisor{Out: "done"}),
 		defaultTimeout: time.Minute,
 	})
-	job, err := m.StartJob(StartRequest{Prompt: "analyze", Cwd: root})
+	job, err := m.StartJob(StartRequest{Prompt: "analyze", Cwd: wpath(t, root, root)})
 	if err != nil {
 		t.Fatalf("StartJob: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestStartJobDisableSkipPermissions(t *testing.T) {
 		supervisorExe:  testutil.WriteFakeSupervisor(t, testutil.FakeSupervisor{Out: "done"}),
 		defaultTimeout: time.Minute,
 	})
-	job, err := m.StartJob(StartRequest{Prompt: "analyze", Cwd: root})
+	job, err := m.StartJob(StartRequest{Prompt: "analyze", Cwd: wpath(t, root, root)})
 	if err != nil {
 		t.Fatalf("StartJob: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestSpawnEnvStrippedOfControlPlaneVariables(t *testing.T) {
 		supervisorExe:  envDumpSupervisor(t),
 		defaultTimeout: time.Minute,
 	})
-	job, err := m.StartJob(StartRequest{Prompt: "p", Cwd: root})
+	job, err := m.StartJob(StartRequest{Prompt: "p", Cwd: wpath(t, root, root)})
 	if err != nil {
 		t.Fatalf("StartJob: %v", err)
 	}

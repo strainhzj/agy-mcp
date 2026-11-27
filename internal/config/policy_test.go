@@ -28,6 +28,64 @@ func writeRecord(t *testing.T, stateDir, project, instance string) {
 	}
 }
 
+// writeRecordFingerprint writes a deployment record naming an explicit
+// snapshot fingerprint, for the cases where the record and the manifest must
+// agree (or deliberately disagree).
+func writeRecordFingerprint(t *testing.T, stateDir, project, instance, fingerprint string) {
+	t.Helper()
+	if err := jobstore.WriteInstanceRecord(stateDir, jobstore.InstanceRecord{
+		Contract:            jobstore.InstanceContract,
+		ProjectID:           project,
+		InstanceID:          instance,
+		SnapshotFingerprint: fingerprint,
+	}); err != nil {
+		t.Fatalf("write instance record: %v", err)
+	}
+}
+
+// writeManifest writes the project manifest the controlled launcher writes
+// for a pi instance: the snapshot root, the fixed worker mount, a content
+// fingerprint and read_only. It returns the manifest path. The file mode is
+// 0440 because LoadProjectManifest refuses a group- or world-writable one.
+func writeManifest(t *testing.T, snapshot, project, fingerprint string) string {
+	t.Helper()
+	path := filepath.Join(dir(t), "project-manifest.json")
+	body := `{"schema_version":1,"project_id":"` + project +
+		`","snapshot_root":"` + snapshot +
+		`","snapshot_fingerprint":"` + fingerprint +
+		`","worker_mount":"/workspace","read_only":true}`
+	if err := os.WriteFile(path, []byte(body), 0o440); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	return path
+}
+
+// piEnv is the environment a controlled launcher exports for a pi instance.
+// The snapshot root lives outside the state dir, the manifest names it, and
+// the deployment record carries the same snapshot fingerprint, so the two
+// records of the one snapshot version agree.
+func piEnv(t *testing.T) map[string]string {
+	t.Helper()
+	snapshot := dir(t)
+	state := dir(t)
+	fingerprint := "sha256:" + strings.Repeat("a", 64)
+	writeRecordFingerprint(t, state, "proj-1", "inst-1", fingerprint)
+	manifest := writeManifest(t, snapshot, "proj-1", fingerprint)
+	return map[string]string{
+		EnvProfile:          policy.ProfilePi,
+		EnvAllowedRoots:     "/workspace",
+		EnvDefaultCwd:       "/workspace",
+		EnvStateDir:         state,
+		EnvInstanceID:       "inst-1",
+		EnvProjectID:        "proj-1",
+		EnvMaxTimeout:       "20m",
+		EnvMaxConcurrency:   "2",
+		EnvSyncWaitCap:      "50s",
+		EnvHTTPAllowedHosts: "192.168.5.45:8865,127.0.0.8:8765",
+		EnvProjectManifest:  manifest,
+	}
+}
+
 // dir returns an existing canonical temporary directory (roots and cwd values
 // are validated by EvalSymlinks, and on macOS the TempDir path itself is a
 // symlink, so tests must compare against the resolved form).
@@ -47,6 +105,11 @@ func dir(t *testing.T) string {
 // clearPolicyEnv unsets every policy variable Resolve reads, so a test only
 // sets what it names. t.Setenv cannot unset, so this uses os.Unsetenv with a
 // cleanup that restores the prior state (including set-but-empty).
+//
+// The list is the full env surface Resolve consults, including the project
+// manifest, the Host allowlist, the mode switches and the sync-wait cap: a
+// variable left over from an earlier test would leak into the
+// upstream-default gate and make a lie of it.
 func clearPolicyEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
@@ -57,6 +120,8 @@ func clearPolicyEnv(t *testing.T) {
 		EnvInstanceID, EnvProjectID, EnvStateDir,
 		EnvHTTPSessionTimeout, EnvHTTPMaxSessions, EnvHTTPMaxInflight,
 		EnvHTTPRatePerSec, EnvStateBudget, EnvSessionTTL,
+		EnvProjectManifest, EnvHTTPAllowedHosts, EnvDisableMode, EnvFixedMode,
+		EnvSyncWaitCap, "AGY_MCP_SNAPSHOT_FINGERPRINT",
 	} {
 		old, had := os.LookupEnv(name)
 		// Best-effort env surgery in a test: a failure here is a broken test
@@ -214,19 +279,8 @@ func TestResolvePolicyErrors(t *testing.T) {
 }
 
 func TestResolvePiProfile(t *testing.T) {
-	root := dir(t)
-	state := dir(t)
-	writeRecord(t, state, "proj-1", "inst-1")
-	c, err := resolveFor(t, map[string]string{
-		EnvProfile:        policy.ProfilePi,
-		EnvAllowedRoots:   root,
-		EnvDefaultCwd:     root,
-		EnvStateDir:       state,
-		EnvInstanceID:     "inst-1",
-		EnvProjectID:      "proj-1",
-		EnvMaxTimeout:     "20m",
-		EnvMaxConcurrency: "2",
-	})
+	env := piEnv(t)
+	c, err := resolveFor(t, env)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -235,9 +289,10 @@ func TestResolvePiProfile(t *testing.T) {
 		t.Fatalf("profile pi not active: %+v", p)
 	}
 	// The profile's fixed switches come from the profile, not the environment:
-	// this test sets none of them and all four must hold.
+	// this test sets none of them and all of them must hold.
 	if !p.ForceSandbox || p.DisableSkipPermissions || p.InlineJSONSchemaOnly ||
-		!p.DisableContinueLatest || !p.RequireHTTPToken {
+		!p.DisableContinueLatest || !p.RequireHTTPToken || !p.DisableJSONSchema ||
+		!p.Mode.DisableClientMode {
 		t.Fatalf("profile defaults wrong: %+v", p)
 	}
 	if p.SessionPolicy != policy.SessionPolicyDisabled {
@@ -246,11 +301,17 @@ func TestResolvePiProfile(t *testing.T) {
 	if c.InstanceID != "inst-1" || c.ProjectID != "proj-1" {
 		t.Fatalf("identity wrong: %q/%q", c.InstanceID, c.ProjectID)
 	}
-	if c.StateDir != state {
-		t.Fatalf("state dir %q, want %q", c.StateDir, state)
+	if env[EnvStateDir] == "" || c.StateDir != env[EnvStateDir] {
+		t.Fatalf("state dir %q, want %q", c.StateDir, env[EnvStateDir])
 	}
-	if c.SnapshotFingerprint != "fp-inst-1" {
-		t.Fatalf("snapshot fingerprint %q, want the record's", c.SnapshotFingerprint)
+	// The manifest's fingerprint is what ownership and replay bind to, and it
+	// must match the launcher-written deployment record.
+	want := "sha256:" + strings.Repeat("a", 64)
+	if c.SnapshotFingerprint != want {
+		t.Fatalf("snapshot fingerprint %q, want the manifest's %q", c.SnapshotFingerprint, want)
+	}
+	if c.Policy.SnapshotFingerprint != want {
+		t.Fatalf("policy fingerprint %q, want the manifest's %q", c.Policy.SnapshotFingerprint, want)
 	}
 	if c.DefaultTimeout != 20*time.Minute || c.MaxConcurrency != 2 {
 		t.Fatalf("timeout/concurrency %s/%d", c.DefaultTimeout, c.MaxConcurrency)
@@ -260,39 +321,25 @@ func TestResolvePiProfile(t *testing.T) {
 func TestResolvePiProfileExplicitManagedOnlyAccepted(t *testing.T) {
 	// managed-only is a Phase 3 value the profile accepts explicitly (it is
 	// what a Phase 3 rollout sets); allow stays refused.
-	root := dir(t)
-	state := dir(t)
-	writeRecord(t, state, "p", "i")
-	c, err := resolveFor(t, map[string]string{
-		EnvProfile:       policy.ProfilePi,
-		EnvAllowedRoots:  root,
-		EnvDefaultCwd:    root,
-		EnvStateDir:      state,
-		EnvInstanceID:    "i",
-		EnvProjectID:     "p",
-		EnvMaxTimeout:    "20m",
-		EnvSessionPolicy: string(policy.SessionPolicyManagedOnly),
-	})
+	env := piEnv(t)
+	env[EnvSessionPolicy] = string(policy.SessionPolicyManagedOnly)
+	c, err := resolveFor(t, env)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	if c.Policy.SessionPolicy != policy.SessionPolicyManagedOnly {
 		t.Fatalf("session policy %q", c.Policy.SessionPolicy)
 	}
+	// managed-only implies a handle TTL, which the profile defaults rather than
+	// leaving at zero (a zero TTL would make every handle born expired).
+	if c.SessionTTL != DefaultSessionTTL {
+		t.Fatalf("session ttl %s, want the %s default", c.SessionTTL, DefaultSessionTTL)
+	}
 }
 
 func TestResolvePiProfileConflicts(t *testing.T) {
-	root := dir(t)
 	base := func() map[string]string {
-		return map[string]string{
-			EnvProfile:      policy.ProfilePi,
-			EnvAllowedRoots: root,
-			EnvDefaultCwd:   root,
-			EnvStateDir:     dir(t),
-			EnvInstanceID:   "i",
-			EnvProjectID:    "p",
-			EnvMaxTimeout:   "20m",
-		}
+		return piEnv(t)
 	}
 	cases := []struct {
 		name string
@@ -304,13 +351,20 @@ func TestResolvePiProfileConflicts(t *testing.T) {
 		{"inline schema knob", map[string]string{EnvInlineJSONSchemaOnly: "true"}, "conflicts with profile"},
 		{"continue-latest opt-out", map[string]string{EnvDisableContinueLatest: "false"}, "conflicts with profile"},
 		{"token optional", map[string]string{EnvRequireHTTPToken: "false"}, "conflicts with profile"},
+		{"mode opt-out", map[string]string{EnvDisableMode: "false"}, "conflicts with profile"},
 		{"session allow", map[string]string{EnvSessionPolicy: "allow"}, "conflicts with profile"},
-		{"two roots", map[string]string{EnvAllowedRoots: root + string(filepath.ListSeparator) + dir(t)}, "exactly one root"},
+		{"two roots", map[string]string{EnvAllowedRoots: "/workspace" + string(filepath.ListSeparator) + "/other"}, "exactly one root"},
+		{"host root", map[string]string{EnvAllowedRoots: dir(t)}, "the only allowed root is /workspace"},
 		{"no state dir", map[string]string{EnvStateDir: ""}, "AGY_MCP_STATE_DIR is required"},
 		{"no instance id", map[string]string{EnvInstanceID: ""}, "AGY_MCP_INSTANCE_ID"},
 		{"no project id", map[string]string{EnvProjectID: ""}, "AGY_MCP_PROJECT_ID"},
 		{"no max timeout", map[string]string{EnvMaxTimeout: ""}, "AGY_MCP_MAX_TIMEOUT is set but empty"},
 		{"no default cwd", map[string]string{EnvDefaultCwd: ""}, "AGY_MCP_DEFAULT_CWD is required"},
+		{"no manifest", map[string]string{EnvProjectManifest: ""}, "AGY_MCP_PROJECT_MANIFEST is required"},
+		{"no allowed hosts", map[string]string{EnvHTTPAllowedHosts: ""}, "AGY_MCP_HTTP_ALLOWED_HOSTS is required"},
+		{"no sync wait cap", map[string]string{EnvSyncWaitCap: ""}, "AGY_MCP_SYNC_WAIT_CAP is required"},
+		{"bad sync wait cap", map[string]string{EnvSyncWaitCap: "soon"}, "AGY_MCP_SYNC_WAIT_CAP"},
+		{"agent selection open", map[string]string{EnvDisableAgentSelection: "false"}, "AGY_MCP_ALLOWED_AGENTS must name"}, {"fixed mode", map[string]string{EnvFixedMode: "accept-edits"}, "fixed mode"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -403,53 +457,61 @@ func equalList(a, b []string) bool {
 // errors. Removing the verifyDeploymentRecord call in Resolve turns every
 // subtest here green-when-broken.
 func TestResolvePiProfileRequiresDeploymentRecord(t *testing.T) {
-	root := dir(t)
-	state := dir(t)
 	base := func() map[string]string {
-		return map[string]string{
-			EnvProfile:      policy.ProfilePi,
-			EnvAllowedRoots: root,
-			EnvDefaultCwd:   root,
-			EnvStateDir:     state,
-			EnvInstanceID:   "inst-1",
-			EnvProjectID:    "proj-1",
-			EnvMaxTimeout:   "20m",
-		}
+		return piEnv(t)
 	}
 	t.Run("missing record refused", func(t *testing.T) {
-		if _, err := resolveFor(t, base()); err == nil || !strings.Contains(err.Error(), "deployment record") {
+		env := base()
+		// A fresh state dir with no deployment record: the launcher writes it, so
+		// its absence means the server was started outside the controlled pipeline.
+		env[EnvStateDir] = dir(t)
+		if _, err := resolveFor(t, env); err == nil || !strings.Contains(err.Error(), "deployment record") {
 			t.Fatalf("resolve without a record = %v, want a deployment-record refusal", err)
 		}
 	})
 	t.Run("foreign identity refused", func(t *testing.T) {
-		writeRecord(t, state, "other-project", "inst-1")
-		if _, err := resolveFor(t, base()); err == nil || !strings.Contains(err.Error(), "belongs to another deployment") {
+		env := base()
+		writeRecord(t, env[EnvStateDir], "other-project", "inst-1")
+		if _, err := resolveFor(t, env); err == nil || !strings.Contains(err.Error(), "belongs to another deployment") {
 			t.Fatalf("resolve against another project's record = %v", err)
 		}
 	})
 	t.Run("unknown contract refused", func(t *testing.T) {
-		if err := jobstore.WriteInstanceRecord(state, jobstore.InstanceRecord{
+		env := base()
+		if err := jobstore.WriteInstanceRecord(env[EnvStateDir], jobstore.InstanceRecord{
 			Contract:            jobstore.InstanceContract + 1,
 			ProjectID:           "proj-1",
 			InstanceID:          "inst-1",
-			SnapshotFingerprint: "fp",
+			SnapshotFingerprint: "sha256:" + strings.Repeat("a", 64),
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := resolveFor(t, base()); err == nil || !strings.Contains(err.Error(), "contract") {
+		if _, err := resolveFor(t, env); err == nil || !strings.Contains(err.Error(), "contract") {
 			t.Fatalf("resolve against a future contract = %v", err)
 		}
 	})
 	t.Run("fingerprintless record refused", func(t *testing.T) {
-		if err := jobstore.WriteInstanceRecord(state, jobstore.InstanceRecord{
+		env := base()
+		if err := jobstore.WriteInstanceRecord(env[EnvStateDir], jobstore.InstanceRecord{
 			Contract:   jobstore.InstanceContract,
 			ProjectID:  "proj-1",
 			InstanceID: "inst-1",
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := resolveFor(t, base()); err == nil || !strings.Contains(err.Error(), "snapshot fingerprint") {
+		if _, err := resolveFor(t, env); err == nil || !strings.Contains(err.Error(), "snapshot fingerprint") {
 			t.Fatalf("resolve against a fingerprintless record = %v", err)
+		}
+	})
+	t.Run("record and manifest fingerprint disagree refused", func(t *testing.T) {
+		// The deployment record and the manifest are two records of the same
+		// snapshot version. When they disagree the instance is half-configured
+		// and must refuse rather than pick one.
+		env := base()
+		writeRecordFingerprint(t, env[EnvStateDir], "proj-1", "inst-1", "sha256:"+strings.Repeat("b", 64))
+		_, err := resolveFor(t, env)
+		if err == nil || !strings.Contains(err.Error(), "does not match the project manifest's") {
+			t.Fatalf("resolve with disagreeing fingerprints = %v, want a refusal", err)
 		}
 	})
 }
@@ -524,18 +586,7 @@ func TestResolveUnsetLimitsKeepUpstreamOff(t *testing.T) {
 // rate and a disk budget, because the plan requires the caps by default, not
 // by opt-in.
 func TestResolvePiProfileLimitDefaults(t *testing.T) {
-	root := dir(t)
-	state := dir(t)
-	writeRecord(t, state, "p", "i")
-	c, err := resolveFor(t, map[string]string{
-		EnvProfile:      policy.ProfilePi,
-		EnvAllowedRoots: root,
-		EnvDefaultCwd:   root,
-		EnvStateDir:     state,
-		EnvInstanceID:   "i",
-		EnvProjectID:    "p",
-		EnvMaxTimeout:   "20m",
-	})
+	c, err := resolveFor(t, piEnv(t))
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -549,6 +600,23 @@ func TestResolvePiProfileLimitDefaults(t *testing.T) {
 	}
 	if c.SessionTTL != 0 {
 		t.Fatalf("session ttl %s set without managed-only", c.SessionTTL)
+	}
+	// The manifest's project identity is what the policy carries, and the
+	// snapshot root it names is what the worker mount maps onto.
+	if c.Policy.ProjectID != "proj-1" || c.Policy.SnapshotRoot == "" {
+		t.Fatalf("manifest values missing from the policy: %+v", c.Policy)
+	}
+	if len(c.Policy.AllowedRoots) != 1 || c.Policy.AllowedRoots[0] != policy.WorkerMountPath {
+		t.Fatalf("allowed roots %q, want only %s", c.Policy.AllowedRoots, policy.WorkerMountPath)
+	}
+	if !c.Policy.Mode.DisableClientMode {
+		t.Fatal("mode not disabled under the profile")
+	}
+	if len(c.Policy.AllowedHosts) == 0 {
+		t.Fatal("allowed hosts empty under the profile")
+	}
+	if c.SyncWaitCap != 50*time.Second || !c.SyncWaitCapSet {
+		t.Fatalf("sync wait cap %s (set=%v), want 50s set", c.SyncWaitCap, c.SyncWaitCapSet)
 	}
 }
 
@@ -578,19 +646,8 @@ func TestResolveExplicitLimits(t *testing.T) {
 // value, and anything else with the variable set is refused.
 func TestResolveManagedOnlySessionTTL(t *testing.T) {
 	profileEnv := func(extra map[string]string) map[string]string {
-		root := dir(t)
-		state := dir(t)
-		writeRecord(t, state, "p", "i")
-		set := map[string]string{
-			EnvProfile:       policy.ProfilePi,
-			EnvAllowedRoots:  root,
-			EnvDefaultCwd:    root,
-			EnvStateDir:      state,
-			EnvInstanceID:    "i",
-			EnvProjectID:     "p",
-			EnvMaxTimeout:    "20m",
-			EnvSessionPolicy: string(policy.SessionPolicyManagedOnly),
-		}
+		set := piEnv(t)
+		set[EnvSessionPolicy] = string(policy.SessionPolicyManagedOnly)
 		maps.Copy(set, extra)
 		return set
 	}

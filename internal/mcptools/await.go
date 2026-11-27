@@ -11,12 +11,16 @@ import (
 )
 
 // parseWait validates a caller-supplied inline wait, clamping it to the shared
-// ceiling (maxSyncWait) and using that same ceiling as the default when the
-// caller names none. agy_run_sync and agy_wait both call it, so the two cannot
-// drift on either the default or the cap.
-func parseWait(s string) (time.Duration, error) {
+// ceiling and using that same ceiling as the default when the caller names
+// none. agy_run_sync and agy_wait both call it, so the two cannot drift on
+// either the default or the cap.
+//
+// The ceiling comes from the manager's resolved SyncWaitCap when there is one,
+// so a protected instance's stated budget is what actually bounds the wait
+// rather than a second read of the environment that could disagree with it.
+func parseWait(mgr *manager.Manager, s string) (time.Duration, error) {
 	if s == "" {
-		return maxSyncWait(), nil
+		return maxSyncWait(mgr), nil
 	}
 	// parsePositiveDuration is the shared parse-and-positivity half; the wait's own
 	// policy is to clamp a too-large value to the sync cap rather than reject it,
@@ -25,7 +29,7 @@ func parseWait(s string) (time.Duration, error) {
 	if err != nil {
 		return 0, err
 	}
-	return min(d, maxSyncWait()), nil
+	return min(d, maxSyncWait(mgr)), nil
 }
 
 // awaitJob blocks until the job is terminal or the deadline passes, emitting

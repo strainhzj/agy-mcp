@@ -46,6 +46,10 @@ type httpGuard struct {
 
 	sessionsMu sync.Mutex
 	sessions   map[string]time.Time // server-issued session ids, last seen
+	// pending counts new sessions whose handler has been admitted but has not
+	// yet assigned its id. It is part of the cap so a concurrent burst of
+	// initializes cannot all pass the gate and register afterwards.
+	pending int
 }
 
 // newHTTPGuard builds the guard for the given limits. maxSessions is only
@@ -122,9 +126,15 @@ func (g *httpGuard) allowRate() bool {
 // sessionRecorder captures the session id the wrapped handler assigns on its
 // response, so the guard tracks exactly the sessions this server issued and
 // never the ids a client invents (those get the SDK's 404 and cost nothing).
+//
+// reserved records that admitSession already counted this request against the
+// cap, so registerSession can release the reservation whether or not the
+// handler went on to assign an id (an error response assigns none, and the
+// slot must still come back).
 type sessionRecorder struct {
 	http.ResponseWriter
 	sessionID string
+	reserved  bool
 }
 
 func (s *sessionRecorder) WriteHeader(code int) {
@@ -150,6 +160,14 @@ func (s *sessionRecorder) WriteHeader(code int) {
 // to prevent: the middleware would then end the request without calling the
 // handler, and Go would answer an empty 200 for every call that carried a
 // session id.
+//
+// The cap counts reservations as well as issued sessions. An initialize
+// request is admitted before its handler assigns the session id, so counting
+// only issued sessions would let a concurrent burst of initializes all pass
+// the cap and register afterwards: MaxSessions=1 would admit two, which is
+// the overshoot the reservation exists to prevent. registerSession releases
+// the reservation and then records the id, so the total never exceeds the cap
+// by more than the in-flight requests already admitted.
 func (g *httpGuard) admitSession(w http.ResponseWriter, r *http.Request) (*sessionRecorder, bool) {
 	id := r.Header.Get(mcpSessionHeader)
 	g.sessionsMu.Lock()
@@ -163,25 +181,38 @@ func (g *httpGuard) admitSession(w http.ResponseWriter, r *http.Request) (*sessi
 		// SDK, which is also the only place that can tell.
 		return nil, true
 	}
-	// No session id: a new-session request (initialize). Refuse at the cap.
-	if len(g.sessions) >= g.limits.MaxSessions {
+	// No session id: a new-session request (initialize). Refuse at the cap,
+	// counting sessions whose handler has not yet assigned an id.
+	if len(g.sessions)+g.pending >= g.limits.MaxSessions {
 		http.Error(w, "server is at its session limit; existing sessions age out after their idle timeout", http.StatusTooManyRequests)
 		return nil, false
 	}
-	return &sessionRecorder{ResponseWriter: w}, true
+	g.pending++
+	return &sessionRecorder{ResponseWriter: w, reserved: true}, true
 }
 
-// registerSession records the id the handler assigned on its response. A
-// concurrent burst could momentarily overshoot the cap between the gate and
-// this registration; the next admitSession call evicts the idle entries and
-// re-reads the count, so the overshoot self-corrects within one request.
+// registerSession releases the admission's reservation and records the id the
+// handler assigned, if any. Both halves run under one lock hold so the
+// released slot and the recorded session cannot be observed separately: a
+// concurrent admitSession sees either "reserved, not yet issued" or "issued,
+// reservation released", never a double count.
+//
+// It is idempotent in the reservation (clearing the flag before releasing), so
+// a handler that somehow settles twice cannot hand the slot back twice and
+// let the cap drift upward.
 func (g *httpGuard) registerSession(rec *sessionRecorder) {
-	if rec == nil || rec.sessionID == "" {
+	if rec == nil {
 		return
 	}
 	g.sessionsMu.Lock()
 	defer g.sessionsMu.Unlock()
-	g.sessions[rec.sessionID] = time.Now()
+	if rec.reserved {
+		rec.reserved = false
+		g.pending--
+	}
+	if rec.sessionID != "" {
+		g.sessions[rec.sessionID] = time.Now()
+	}
 }
 
 // evictIdleLocked drops sessions idle past the configured timeout, so retired

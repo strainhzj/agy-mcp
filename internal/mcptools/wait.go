@@ -31,7 +31,7 @@ func registerWait(s *mcp.Server, mgr *manager.Manager) {
 			"client asks for them. Outliving the wait cap is not a failure: the job keeps " +
 			"running under its own timeout, so call agy_wait again.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in waitInput) (*mcp.CallToolResult, runSyncOutput, error) {
-		wait, err := parseWait(in.Wait)
+		wait, err := parseWait(mgr, in.Wait)
 		if err != nil {
 			return nil, runSyncOutput{}, err
 		}

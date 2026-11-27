@@ -91,7 +91,7 @@ func TestParseWaitErrors(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := parseWait(tc.wait)
+			_, err := parseWait(nil, tc.wait)
 			if err == nil {
 				t.Fatalf("wait %q was accepted, want a rejection", tc.wait)
 			}
@@ -138,7 +138,7 @@ func TestParseWaitCeiling(t *testing.T) {
 	}
 
 	t.Run("default is the ceiling", func(t *testing.T) {
-		got, err := parseWait("")
+		got, err := parseWait(nil, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -147,7 +147,7 @@ func TestParseWaitCeiling(t *testing.T) {
 		}
 	})
 	t.Run("over-ceiling clamps to the ceiling", func(t *testing.T) {
-		got, err := parseWait("30m")
+		got, err := parseWait(nil, "30m")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -156,7 +156,7 @@ func TestParseWaitCeiling(t *testing.T) {
 		}
 	})
 	t.Run("under-ceiling passes through unchanged", func(t *testing.T) {
-		got, err := parseWait("5s")
+		got, err := parseWait(nil, "5s")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -166,7 +166,7 @@ func TestParseWaitCeiling(t *testing.T) {
 	})
 	t.Run("env override raises the cap", func(t *testing.T) {
 		t.Setenv(config.EnvSyncWaitCap, "3m")
-		def, err := parseWait("")
+		def, err := parseWait(nil, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -175,7 +175,7 @@ func TestParseWaitCeiling(t *testing.T) {
 		}
 		// A wait the built-in ceiling would have clamped now passes: the override
 		// raised the cap above it.
-		got, err := parseWait("2m")
+		got, err := parseWait(nil, "2m")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -185,7 +185,7 @@ func TestParseWaitCeiling(t *testing.T) {
 	})
 	t.Run("env override lowers the cap", func(t *testing.T) {
 		t.Setenv(config.EnvSyncWaitCap, "30s")
-		def, err := parseWait("")
+		def, err := parseWait(nil, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -193,7 +193,7 @@ func TestParseWaitCeiling(t *testing.T) {
 			t.Fatalf("default under lowered override = %v, want 30s", def)
 		}
 		// A wait above the lowered cap clamps down to it.
-		got, err := parseWait("60s")
+		got, err := parseWait(nil, "60s")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -204,7 +204,7 @@ func TestParseWaitCeiling(t *testing.T) {
 	t.Run("invalid override is ignored", func(t *testing.T) {
 		for _, bad := range []string{"nonsense", "0s", "-1s"} {
 			t.Setenv(config.EnvSyncWaitCap, bad)
-			got, err := parseWait("")
+			got, err := parseWait(nil, "")
 			if err != nil {
 				t.Fatal(err)
 			}

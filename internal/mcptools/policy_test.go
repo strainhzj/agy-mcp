@@ -15,19 +15,42 @@ import (
 
 // protectedManager builds a manager with the protected single-project policy
 // and a fresh state dir. Nothing here execs agy.
+//
+// The policy is the worker-view shape internal/config resolves: the only
+// allowed root is the worker mount, and the manifest's snapshot root is what
+// that mount maps onto on the host. So a caller passes /workspace/... and the
+// value that comes back out is the same spelling, never a host path.
 func protectedManager(t *testing.T, root string) *manager.Manager {
 	t.Helper()
 	return manager.New(config.Config{
 		StateDir: t.TempDir(),
 		Policy: policy.Policy{
-			Profile:       policy.ProfilePi,
-			AllowedRoots:  []string{root},
-			DefaultCwd:    root,
-			SessionPolicy: policy.SessionPolicyDisabled,
+			Profile:             policy.ProfilePi,
+			AllowedRoots:        []string{"/workspace"},
+			DefaultCwd:          "/workspace",
+			WorkerMount:         "/workspace",
+			SnapshotRoot:        root,
+			SessionPolicy:       policy.SessionPolicyDisabled,
+			ForceSandbox:        true,
+			DisableJSONSchema:   true,
+			Mode:                policy.ModePolicy{DisableClientMode: true},
+			AllowedHosts:        []string{"127.0.0.8:8765"},
+			RequireHTTPToken:    true,
+			SnapshotFingerprint: "sha256:" + strings.Repeat("a", 64),
+			ProjectID:           "proj-1",
+			InstanceID:          "inst-1",
 		},
 		ProjectID:  "proj-1",
 		InstanceID: "inst-1",
 	})
+}
+
+// protectedManagerPolicy returns the protected policy shape on its own, for
+// tests that build a Manager with their own state dir (so "no job was
+// created" can be asserted against a store the test owns).
+func protectedManagerPolicy(t *testing.T, root string) policy.Policy {
+	t.Helper()
+	return protectedManager(t, root).Policy()
 }
 
 // canonicalTempDir is an existing directory with its symlink-resolved path,

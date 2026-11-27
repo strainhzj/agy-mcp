@@ -12,6 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tphakala/agy-mcp/v2/internal/manager"
+	"github.com/tphakala/agy-mcp/v2/internal/policy"
 )
 
 // ServeStdio runs the server over stdio until the client disconnects or ctx is
@@ -34,13 +35,21 @@ func ServeStdio(ctx context.Context, mgr *manager.Manager) error {
 // cross-origin protection: a request without a matching Authorization: Bearer
 // <token> header is rejected with 401. An empty token leaves HTTP mode
 // unauthenticated (the default).
+//
+// Under a protected profile an additional Host allowlist sits inside the
+// bearer check (see withAllowedHosts): the profile disables the SDK's
+// localhost Host check so a bridge-published Host header can reach the
+// JSON-RPC layer, and the allowlist is the replacement that keeps the check's
+// value. A Host outside the configured set is refused with 403.
 func HTTPHandler(mgr *manager.Manager, token string) http.Handler {
 	// The transport limits (idle session timeout and friends) come from the
 	// resolved policy; zero limits leave the options nil, which is exactly the
 	// SDK's upstream default behavior. Request size is bounded by the SDK's
 	// own default body cap (4 MiB).
 	var opts *mcp.StreamableHTTPOptions
+	var pol policy.Policy
 	if mgr != nil {
+		pol = mgr.Policy()
 		if g := mgr.HTTPGuard(); g.Limited() {
 			opts = &mcp.StreamableHTTPOptions{SessionTimeout: g.SessionTimeout}
 		}
@@ -51,8 +60,9 @@ func HTTPHandler(mgr *manager.Manager, token string) http.Handler {
 		// for. The check defends browsers against DNS rebinding, and the
 		// cross-origin protection below plus the profile's mandatory bearer
 		// token are the two checks that actually cover that attack here, so
-		// only a protected deployment disables it.
-		if mgr.Policy().Protected() {
+		// only a protected deployment disables it. The Host allowlist
+		// (withAllowedHosts) is what replaces the check it turns off.
+		if pol.Protected() {
 			if opts == nil {
 				opts = &mcp.StreamableHTTPOptions{}
 			}
@@ -66,7 +76,29 @@ func HTTPHandler(mgr *manager.Manager, token string) http.Handler {
 	if mgr != nil {
 		h = installGuard(mgr.HTTPGuard(), h)
 	}
+	h = withAllowedHosts(pol, h)
 	return withBearerAuth(token, http.NewCrossOriginProtection().Handler(h))
+}
+
+// withAllowedHosts refuses a request whose Host header is outside the
+// policy's allowlist, and is a pass-through when the allowlist is empty (the
+// unrestricted upstream behavior, where the SDK's own localhost check stays
+// in charge).
+//
+// It sits inside the bearer check, so an unauthenticated caller learns
+// nothing about which Hosts are accepted: a wrong token gets 401 whatever
+// Host it names, and a correct token with a wrong Host gets 403.
+func withAllowedHosts(pol policy.Policy, h http.Handler) http.Handler {
+	if len(pol.AllowedHosts) == 0 {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !pol.HostAllowed(r.Host) {
+			http.Error(w, "host not allowed", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // withBearerAuth wraps h to require Authorization: Bearer <token>. An empty token

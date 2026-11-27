@@ -1,7 +1,6 @@
 package mcptools
 
 import (
-	"context"
 	"os"
 	"time"
 
@@ -34,7 +33,23 @@ import (
 // names none (parseWait), so agy_run_sync and agy_wait cannot drift on either.
 // Longer runs are for agy_run + agy_wait/agy_status, re-issued until the job
 // is terminal.
-func maxSyncWait() time.Duration {
+//
+// The reader takes the manager's resolved value when there is one, because
+// config.Resolve refuses a missing or unparseable value under the pi profile:
+// reading the environment directly here would silently fall back to the 90s
+// default for exactly the deployment that must state its client-timeout
+// budget, which is the failure mode the strict resolution exists to prevent.
+//
+// A zero resolved value means "not resolved" (a hand-built Config, or the
+// nil-manager shape the tool-list tests use), and falls back to the
+// environment/default path: a zero ceiling would make every inline wait expire
+// before it started, which reads as a job that never finishes.
+func maxSyncWait(mgr *manager.Manager) time.Duration {
+	if mgr != nil {
+		if resolved := mgr.SyncWaitCap(); resolved > 0 {
+			return resolved
+		}
+	}
 	return config.ResolveSyncWaitCap(os.Getenv)
 }
 
@@ -52,6 +67,13 @@ type runSyncOutput struct {
 
 // registerRunSync adds the agy_run_sync tool: start a job, wait inline for it
 // (bounded), streaming progress notifications when the client asked for them.
+//
+// The registration itself lives in runfields.go, which selects the input
+// schema the policy advertises (the unrestricted one, the protected one, or
+// the managed-only one carrying the continuation handle) and applies the
+// raw-key gate before a job is created. This wrapper only resolves the
+// policy from the manager, keeping the nil-manager shape the tool-list tests
+// rely on.
 func registerRunSync(s *mcp.Server, mgr *manager.Manager) {
 	// mgr may be nil (the tool-list tests connect without one); a nil manager
 	// means the unrestricted description, like a zero policy would.
@@ -59,39 +81,5 @@ func registerRunSync(s *mcp.Server, mgr *manager.Manager) {
 	if mgr != nil {
 		pol = mgr.Policy()
 	}
-	mcp.AddTool(s, &mcp.Tool{
-		Name:        toolAgyRunSync,
-		Title:       "Delegate to agy (wait inline)",
-		Annotations: annDelegate,
-		Description: runDescription(pol, "Delegate a prompt to an agy model and wait for the result inline (bounded by wait). "+
-			"Use when the answer is needed before your next step AND the task is bounded enough to finish within the wait: "+
-			"a focused peer review, a second opinion, a rubber-duck question. "+
-			"For open-ended work that routinely runs past the wait cap (web research, a whole-codebase review), "+
-			"and for parallel work, prefer agy_run. If this call outlives its wait the job keeps running: "+
-			"block on the returned job_id with agy_wait, or take a single non-blocking look with agy_status. "+
-			"If a transport failure could make job creation ambiguous, supply idempotency_key and reuse it on the retry. "+
-			"Streams progress notifications while waiting when the client asks for them. "+
-			"The delegated agent runs with permission checks disabled: it can edit files under cwd and under any "+
-			"dirs, can create files outside them by absolute path, and may reach the network. "+
-			"Say so in the prompt if the run must not touch the repo. "+
-			"For work that may be skipped (a peer review, a second opinion, a rubber-duck pass), check agy_usage and pass priority optional so the run is refused while quota is low.", protectedAgyRunSyncDescription, protectedAgyRunSyncManagedDescription),
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in runSyncInput) (*mcp.CallToolResult, runSyncOutput, error) {
-		wait, err := parseWait(in.Wait)
-		if err != nil {
-			return nil, runSyncOutput{}, err
-		}
-		startReq, err := in.toStartRequest()
-		if err != nil {
-			return nil, runSyncOutput{}, err
-		}
-		job, err := mgr.StartJob(startReq)
-		if err != nil {
-			return nil, runSyncOutput{}, err
-		}
-		out, err := awaitJob(ctx, req, mgr, job.ID, time.Now().Add(wait))
-		if err != nil {
-			return nil, runSyncOutput{}, err
-		}
-		return nil, out, nil
-	})
+	registerRunSyncTool(s, mgr, pol)
 }

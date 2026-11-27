@@ -548,6 +548,25 @@ var (
 	protectedListSessionsDescription        = "Disabled on this server: its session policy forbids conversation continuation, so this call always fails with a policy error. Start a fresh run and restate any needed context instead."
 	protectedListSessionsManagedDescription = "Disabled on this server: continuation works only with the handles this server issued after a completed run, so there is nothing to list. Pass a run's conversation_id handle back to agy_run or agy_run_sync to continue it."
 	protectedListAgentsDescription          = "Disabled on this server: agent selection is not accepted, so this call returns an empty list."
+
+	// The unrestricted run descriptions live here as constants so the
+	// registration sites (registerRun, registerRunSync) and any test that
+	// asserts on them read one copy. A description that only existed inline at
+	// the registration site could not be asserted against, and a test carrying
+	// its own copy would drift from it silently.
+	agyRunDefaultDescription     = "Delegate a prompt to a background agy model as an async job (peer review, research, or any self-contained task) and keep working. Returns a job_id; block on it with agy_wait or poll it with agy_status. Prefer this over agy_run_sync for long runs, for open-ended work that routinely outlives an inline wait (web research, a large review), and to fan several tasks out in parallel; use agy_run_sync instead when you need the answer before your next step. If a transport failure could make job creation ambiguous, supply idempotency_key and reuse it on the retry. The delegated agent runs with permission checks disabled: it can edit files under cwd and under any dirs, can create files outside them by absolute path, and may reach the network. Say so in the prompt if the run must not touch the repo. For work that may be skipped (a peer review, a second opinion), check agy_usage and pass priority optional so the run is refused while quota is low."
+	agyRunSyncDefaultDescription = "Delegate a prompt to an agy model and wait for the result inline (bounded by wait). " +
+		"Use when the answer is needed before your next step AND the task is bounded enough to finish within the wait: " +
+		"a focused peer review, a second opinion, a rubber-duck question. " +
+		"For open-ended work that routinely runs past the wait cap (web research, a whole-codebase review), " +
+		"and for parallel work, prefer agy_run. If this call outlives its wait the job keeps running: " +
+		"block on the returned job_id with agy_wait, or take a single non-blocking look with agy_status. " +
+		"If a transport failure could make job creation ambiguous, supply idempotency_key and reuse it on the retry. " +
+		"Streams progress notifications while waiting when the client asks for them. " +
+		"The delegated agent runs with permission checks disabled: it can edit files under cwd and under any " +
+		"dirs, can create files outside them by absolute path, and may reach the network. " +
+		"Say so in the prompt if the run must not touch the repo. " +
+		"For work that may be skipped (a peer review, a second opinion, a rubber-duck pass), check agy_usage and pass priority optional so the run is refused while quota is low."
 )
 
 // listSessionsDescription picks the list_sessions description by policy: the
@@ -576,13 +595,23 @@ func runDescription(pol policy.Policy, defaultDesc, protectedDesc, managedDesc s
 	return protectedDesc
 }
 
-// toolDescription picks the protected variant when the server runs under a
-// protected profile; the default text is the upstream one, byte for byte.
-func toolDescription(protected bool, defaultDesc, protectedDesc string) string {
-	if protected {
-		return protectedDesc
+// listAgentsDescription picks the list_agents text by what the policy actually
+// does, not merely by whether a profile is active. A protected instance that
+// opened agent selection with a whitelist still accepts the parameter, so the
+// "not accepted" text would be a lie there; the whitelist text names what a
+// caller may pass. Deciding this from the policy (rather than from Protected)
+// is what keeps the description honest in both shapes.
+func listAgentsDescription(pol policy.Policy, defaultDesc string) string {
+	if !pol.Protected() {
+		return defaultDesc
 	}
-	return defaultDesc
+	if pol.DisableAgentSelection {
+		return protectedListAgentsDescription
+	}
+	if len(pol.AllowedAgents) > 0 {
+		return "List the agent names this server accepts, so the agent parameter of agy_run and agy_run_sync can be given one of them. Pass a value from agents verbatim. Only these agents are accepted: " + strings.Join(pol.AllowedAgents, ", ") + ". Omitting agent uses agy's default agent, which is usually what you want"
+	}
+	return protectedListAgentsDescription
 }
 
 // modelListDescription is the list_models description, with one appended
@@ -616,27 +645,7 @@ func NewServer(mgr *manager.Manager) *mcp.Server {
 		Instructions: instructions,
 	})
 
-	mcp.AddTool(s, &mcp.Tool{
-		Name:        toolAgyRun,
-		Title:       "Delegate to agy (async)",
-		Annotations: annDelegate,
-		Description: runDescription(pol, "Delegate a prompt to a background agy model as an async job (peer review, research, or any self-contained task) and keep working. Returns a job_id; block on it with agy_wait or poll it with agy_status. Prefer this over agy_run_sync for long runs, for open-ended work that routinely outlives an inline wait (web research, a large review), and to fan several tasks out in parallel; use agy_run_sync instead when you need the answer before your next step. If a transport failure could make job creation ambiguous, supply idempotency_key and reuse it on the retry. The delegated agent runs with permission checks disabled: it can edit files under cwd and under any dirs, can create files outside them by absolute path, and may reach the network. Say so in the prompt if the run must not touch the repo. For work that may be skipped (a peer review, a second opinion), check agy_usage and pass priority optional so the run is refused while quota is low.", protectedAgyRunDescription, protectedAgyRunManagedDescription),
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in runInput) (*mcp.CallToolResult, runOutput, error) {
-		req, err := in.toStartRequest()
-		if err != nil {
-			return nil, runOutput{}, err
-		}
-		job, err := mgr.StartJob(req)
-		if err != nil {
-			return nil, runOutput{}, err
-		}
-		// agy_run returns before the job produces anything else, so this is the one
-		// tool that has to wait for agy to name a fresh conversation. The tools that
-		// report a run's conversation fill it from a Status read, which costs nothing
-		// extra because they were reading the status anyway. (list_sessions reports
-		// conversation ids too, but those come from agy's own cache, not from a run.)
-		return nil, runOutput{JobID: job.ID, ConversationID: mgr.AwaitConversationID(ctx, job), State: job.State, Quota: quotaFor(mgr)}, nil
-	})
+	registerRun(s, mgr, pol)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        toolAgyStatus,
@@ -714,7 +723,7 @@ func NewServer(mgr *manager.Manager) *mcp.Server {
 		Name:        toolListAgents,
 		Title:       "List agy agents",
 		Annotations: annReadExternal,
-		Description: toolDescription(protected, "List the agy agent names accepted by the agent parameter of agy_run and agy_run_sync. Pass a value from agents verbatim; there is no separate id and label, unlike list_models, because agy takes an agent name directly. Call it only when you intend to select a specific agent; omitting agent uses agy's default, so most runs need no call here. Pass cwd, the same directory you give agy_run, to include that repository's project agents; without it they are not listed. An empty list means no agents are configured, which is common and not an error. Shells out to the agy CLI, so it fails if agy is missing from PATH or not authenticated.", protectedListAgentsDescription),
+		Description: listAgentsDescription(pol, "List the agy agent names accepted by the agent parameter of agy_run and agy_run_sync. Pass a value from agents verbatim; there is no separate id and label, unlike list_models, because agy takes an agent name directly. Call it only when you intend to select a specific agent; omitting agent uses agy's default, so most runs need no call here. Pass cwd, the same directory you give agy_run, to include that repository's project agents; without it they are not listed. An empty list means no agents are configured, which is common and not an error. Shells out to the agy CLI, so it fails if agy is missing from PATH or not authenticated."),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in agentsInput) (*mcp.CallToolResult, agentsOutput, error) {
 		agents, err := mgr.ListAgents(ctx, in.Cwd)
 		if err != nil {

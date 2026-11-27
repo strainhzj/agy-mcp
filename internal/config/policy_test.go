@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"maps"
 	"os"
 	"path/filepath"
@@ -55,9 +56,16 @@ func writeRecordFingerprint(t *testing.T, stateDir, project, instance, fingerpri
 func writeManifest(t *testing.T, snapshot, project, fingerprint string) string {
 	t.Helper()
 	path := filepath.Join(dir(t), "project-manifest.json")
+	// The snapshot root is an OS path: on Windows it carries backslashes that
+	// are invalid JSON escapes, so it goes through json.Marshal rather than
+	// being spliced into the template raw.
+	root, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot root: %v", err)
+	}
 	body := `{"schema_version":1,"project_id":"` + project +
-		`","snapshot_root":"` + snapshot +
-		`","snapshot_fingerprint":"` + fingerprint +
+		`","snapshot_root":` + string(root) +
+		`,"snapshot_fingerprint":"` + fingerprint +
 		`","worker_mount":"/workspace","read_only":true}`
 	perm := os.FileMode(0o440)
 	if runtime.GOOS == "windows" {

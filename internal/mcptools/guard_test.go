@@ -126,6 +126,38 @@ func TestGuardSessionCap(t *testing.T) {
 	}
 }
 
+// TestGuardKnownSessionReachesHandler pins the pass-through half of
+// admitSession. The bug this guards against collapsed "refused" and "pass
+// through" into one nil return, so every request carrying a session id
+// (everything after initialize) was answered by Go's empty 200 before the
+// handler ever ran. The status code alone cannot tell the two apart, so the
+// assertion is on the handler's body: with the collapsed return the handler
+// never executes and the body is empty.
+func TestGuardKnownSessionReachesHandler(t *testing.T) {
+	g := newHTTPGuard(config.HTTPGuard{MaxSessions: 2, SessionTimeout: time.Minute})
+	body := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"handled":true}`))
+	})
+	// Issue one session through the recorder path.
+	rec := httptest.NewRecorder()
+	g.middleware(stubHandler("sess-known")).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session issue = %d, want 200", rec.Code)
+	}
+	// A request carrying it must reach the handler and come back with its body.
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req.Header.Set(mcpSessionHeader, "sess-known")
+	g.middleware(body).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("known session = %d, want 200", rec.Code)
+	}
+	if got := rec.Body.String(); got != `{"handled":true}` {
+		t.Fatalf("known session body = %q, want the handler's body; an empty body means the middleware ended the request without calling the handler", got)
+	}
+}
+
 // TestGuardIdleSessionEviction pins the retirement half of the cap: sessions
 // idle past the timeout stop counting against it, so new sessions are
 // admitted again.

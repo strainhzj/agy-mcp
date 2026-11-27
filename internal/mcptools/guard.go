@@ -86,11 +86,13 @@ func (g *httpGuard) middleware(h http.Handler) http.Handler {
 			return
 		}
 		if g.limits.MaxSessions > 0 {
-			if done := g.admitSession(w, r); done != nil {
-				defer g.registerSession(done)
-				w = done
-			} else {
-				return
+			rec, admit := g.admitSession(w, r)
+			if !admit {
+				return // the refusal is already written
+			}
+			if rec != nil {
+				defer g.registerSession(rec)
+				w = rec
 			}
 		}
 		h.ServeHTTP(w, r)
@@ -132,12 +134,23 @@ func (s *sessionRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-// admitSession gates new sessions on the cap. A request carrying a session id
-// this server issued passes and refreshes its last-seen time; a request
-// without one is a new session and is refused while the cap holds. The return
-// is a recorder to install for the handler (nil means "respond without
-// calling the handler", already done).
-func (g *httpGuard) admitSession(w http.ResponseWriter, r *http.Request) *sessionRecorder {
+// admitSession gates new sessions on the cap and reports what the handler
+// must do next. The two returns are deliberately separate, because a nil
+// recorder means two very different things:
+//
+//   - (nil, false): the request was refused and the error is already written
+//     (a new session arrived while the cap holds);
+//   - (nil, true): pass the request through untouched. Either it carries a
+//     session id (known: refresh it; unknown: let the handler answer it, a
+//     404 that costs one SDK lookup and registers nothing);
+//   - (rec, true): a new session under the cap; the handler must write
+//     through the recorder so the id it assigns can be registered.
+//
+// Collapsing the first two into one nil return is the bug this shape exists
+// to prevent: the middleware would then end the request without calling the
+// handler, and Go would answer an empty 200 for every call that carried a
+// session id.
+func (g *httpGuard) admitSession(w http.ResponseWriter, r *http.Request) (*sessionRecorder, bool) {
 	id := r.Header.Get(mcpSessionHeader)
 	g.sessionsMu.Lock()
 	defer g.sessionsMu.Unlock()
@@ -145,18 +158,17 @@ func (g *httpGuard) admitSession(w http.ResponseWriter, r *http.Request) *sessio
 	if id != "" {
 		if _, known := g.sessions[id]; known {
 			g.sessions[id] = time.Now()
-			return nil // pass through, no recorder needed
 		}
-		// Unknown id: not issued here. Let the handler answer it (404 for a
-		// bogus id); it costs one SDK lookup and registers nothing.
-		return nil
+		// Known or not, the handler answers: a bogus id gets its 404 from the
+		// SDK, which is also the only place that can tell.
+		return nil, true
 	}
 	// No session id: a new-session request (initialize). Refuse at the cap.
 	if len(g.sessions) >= g.limits.MaxSessions {
 		http.Error(w, "server is at its session limit; existing sessions age out after their idle timeout", http.StatusTooManyRequests)
-		return nil
+		return nil, false
 	}
-	return &sessionRecorder{ResponseWriter: w}
+	return &sessionRecorder{ResponseWriter: w}, true
 }
 
 // registerSession records the id the handler assigned on its response. A

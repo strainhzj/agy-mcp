@@ -48,8 +48,13 @@ set -eu
 # ---------------------------------------------------------------------------
 
 : "${PI_PROJECT_ID:?set PI_PROJECT_ID (the deployment-assigned project id)}"
+# The charset is the project-manifest contract, not a shell convenience: the
+# server validates project_id against lowercase letters, digits, dot, dash and
+# underscore, so an id the launcher accepts but the manifest would refuse is a
+# launch that dies at startup with a confusing message. Refuse it here, where
+# the operator is looking.
 case "$PI_PROJECT_ID" in
-    *[!A-Za-z0-9._-]*) die "PI_PROJECT_ID must be letters, digits, dot, dash or underscore; it is baked into the deployment record" ;;
+    *[!a-z0-9._-]*) die "PI_PROJECT_ID must be lowercase letters, digits, dot, dash or underscore; the project manifest validates the same shape" ;;
 esac
 : "${PI_SNAPSHOT_DIR:?set PI_SNAPSHOT_DIR (the host directory the read-only snapshot is served from)}"
 : "${PI_STATE_DIR:?set PI_STATE_DIR (this instance's private job-state directory)}"
@@ -147,12 +152,31 @@ fi
 
 # Fingerprint the snapshot the deployment serves. The fingerprint binds job
 # ownership and idempotent replay to one snapshot version (the server refuses
-# both across versions), so it must change when the served content changes:
-# the hash covers the path, size and mtime of every file and directory in the
-# tree. Cost is one pass over the snapshot at launch time, which is the price
-# of making a redeploy a new deployment instead of a silent continuation.
-PI_SNAPSHOT_FINGERPRINT=$(cd "$PI_SNAPSHOT_DIR" && find . -xdev \( -type f -o -type d \) -printf '%y %p %s %T@\n' 2>/dev/null | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+# both across versions), so it must change when the served CONTENT changes.
+#
+# The hash therefore covers each file's contents, not only its metadata: a
+# metadata-only digest (path, size, mtime) survives an in-place edit that keeps
+# the size and restores the timestamps, which is exactly the shape a redeploy
+# produces when a controlled pipeline rewrites a file. Cost is one content pass
+# over the snapshot at launch time, which is the price of making a redeploy a
+# new deployment instead of a silent continuation of stale answers.
+#
+# Directories contribute their path only (a directory has no content), and the
+# whole list is sorted before hashing so the digest does not depend on
+# filesystem iteration order. Symlinks are skipped rather than followed: a link
+# pointing outside the snapshot is a deployment error the snapshot pipeline is
+# responsible for stripping, and following it here would fold outside content
+# into this deployment's identity.
+PI_SNAPSHOT_FINGERPRINT=$(cd "$PI_SNAPSHOT_DIR" && find . -xdev \( -type f -o -type d \) -print 2>/dev/null | LC_ALL=C sort | while IFS= read -r p; do
+    if [ -f "$p" ]; then
+        printf 'f %s %s ' "$p" "$(wc -c < "$p" | tr -d ' ')"
+        sha256sum "$p" | cut -d' ' -f1
+    else
+        printf 'd %s\n' "$p"
+    fi
+done | sha256sum | cut -d' ' -f1)
 [ -n "$PI_SNAPSHOT_FINGERPRINT" ] || die "cannot fingerprint the snapshot dir $PI_SNAPSHOT_DIR"
+PI_SNAPSHOT_FINGERPRINT="sha256:$PI_SNAPSHOT_FINGERPRINT"
 
 # Nested namespaces: the worker view nests bwrap. MEASURED against this
 # host's bwrap build: nesting starts and one masked directory stays masked
@@ -184,6 +208,30 @@ gemini_size_bytes() {
 PI_GEMINI_TMPFS_BYTES=$(gemini_size_bytes "$PI_GEMINI_TMPFS_SIZE") \
     || die "PI_GEMINI_TMPFS_SIZE must be like 256MiB or a plain byte count"
 [ "$PI_GEMINI_TMPFS_BYTES" -gt 0 ] || die "PI_GEMINI_TMPFS_SIZE must be positive"
+
+# The fixed neutral path the OUTER namespace binds the host snapshot at, and
+# what the project manifest names as its snapshot root. It is deliberately not
+# /workspace: the control plane runs in the host view, where no such mount
+# exists, and the mapping from the worker view (/workspace) onto this path is
+# exactly what the server implements from the manifest. The worker's inner
+# namespace binds this path at /workspace.
+PI_SNAPSHOT_MOUNT="/snapshot"
+
+# The HTTP Host allowlist the server enforces. No default: it names the
+# published endpoint the client actually reaches and this instance's own listen
+# address, and guessing either would lock the real client out or admit an
+# endpoint nobody chose. The server refuses to start under the profile without
+# it, so a missing value here is a deployment error, not a silent widening.
+: "${PI_ALLOWED_HOSTS:?set PI_ALLOWED_HOSTS (comma-separated host[:port]: the published endpoint and this instance's listen address, e.g. 192.168.5.45:8865,127.0.0.8:8765)}"
+case "$PI_ALLOWED_HOSTS" in
+    *,*|*:*) ;;
+    *) die "PI_ALLOWED_HOSTS must name at least the published endpoint and this instance's listen address (host:port), comma-separated" ;;
+esac
+for h in $(printf '%s' "$PI_ALLOWED_HOSTS" | tr ',' ' '); do
+    case "$h" in
+        *[!A-Za-z0-9.:_-]*|'') die "PI_ALLOWED_HOSTS entry $h: want host[:port] with no scheme, path or whitespace" ;;
+    esac
+done
 
 mkdir -p "$PI_CONTROL_DIR" "$PI_STATE_DIR"
 chmod 700 "$PI_CONTROL_DIR" "$PI_STATE_DIR"
@@ -220,6 +268,34 @@ fi
 mv "$record_tmp" "$PI_STATE_DIR/instance.json"
 chmod 600 "$PI_STATE_DIR/instance.json"
 
+# ---------------------------------------------------------------------------
+# Project manifest: the deployment-side statement of what this instance serves.
+# ---------------------------------------------------------------------------
+
+# The manifest is what the server loads at startup to learn the project it
+# serves and where the snapshot lives. It is written HERE rather than read from
+# the workspace so that nothing a workspace write can reach can change it, and
+# it lives in the control dir rather than the state dir because it is
+# deployment configuration, not job state: the job-store budget and GC must not
+# account for it, and a manifest inside the state dir is refused at startup.
+#
+# snapshot_root names the path the CONTROL PLANE resolves. The outer namespace
+# binds the host snapshot at the fixed neutral path below (never at /workspace:
+# the control plane runs in the host view, where no such mount exists, and that
+# is exactly the mapping the server implements). PI_SNAPSHOT_DIR stays the host
+# path, used as the bind source and recorded for the operator.
+manifest_file="$PI_CONTROL_DIR/project-manifest.json"
+manifest_tmp="$manifest_file.tmp"
+printf '{"schema_version":1,"project_id":"%s","snapshot_root":"%s","snapshot_fingerprint":"%s","worker_mount":"/workspace","read_only":true}\n' \
+    "$PI_PROJECT_ID" "$PI_SNAPSHOT_MOUNT" "$PI_SNAPSHOT_FINGERPRINT" > "$manifest_tmp"
+if [ -s "$manifest_file" ] && ! cmp -s "$manifest_tmp" "$manifest_file"; then
+    die "control dir $PI_CONTROL_DIR holds a manifest for another project or snapshot; use a fresh control dir for a new deployment"
+fi
+mv "$manifest_tmp" "$manifest_file"
+# Read-only for everyone but the owner: the server only reads it, and a
+# group- or world-writable manifest is refused at startup.
+chmod 440 "$manifest_file"
+
 # The bearer token is generated once and handed only to the server process,
 # which reads it from a file inside the namespace. It never appears in an
 # argv, and the worker wrapper below rebuilds agy's environment from a
@@ -241,6 +317,13 @@ mkdir -p "$stage/bin" "$stage/run-control"
 cp "$token_file" "$stage/run-control/token"
 chmod 400 "$stage/run-control/token"
 chmod 700 "$stage" "$stage/bin" "$stage/run-control"
+
+# The project manifest rides into the namespace read-only, next to the token:
+# the server reads it at startup and nothing else may write it. It is staged
+# rather than pointed at directly so the control plane's only view of it is the
+# read-only one the sandbox mounts.
+cp "$manifest_file" "$stage/project-manifest.json"
+chmod 400 "$stage/project-manifest.json"
 
 # Pin the binaries at launch time: the worker view mounts the real agy at a
 # fixed path, and a host-side upgrade mid-run cannot swap binaries under the
@@ -297,7 +380,11 @@ chmod 555 "$stage/bin/agy-mcp"
     printf '  --tmpfs /run \\\n'
     printf '  --tmpfs /home \\\n'
     printf '  --tmpfs /home/worker \\\n'
-    printf '  --ro-bind /workspace /workspace \\\n'
+    # The worker's view of the project: the neutral mount point agy and the
+    # caller's --add-dir arguments speak. It is bound from the outer
+    # namespace's snapshot mount, never from the host path, so nothing
+    # inside the worker can name the host directory the snapshot came from.
+    printf '  --ro-bind /snapshot /workspace \\\n'
     if [ -n "$PI_AGY_CONFIG_DIR" ]; then
         # The service identity is the worker's own, but it never arrives as a
         # writable host mount: /seed is the READ-ONLY staged copy (bound by
@@ -356,6 +443,19 @@ chmod 555 "$stage/bin/agy-wrapped"
     printf 'export AGY_MCP_ALLOWED_ROOTS=/workspace\n'
     printf 'export AGY_MCP_DEFAULT_CWD=/workspace\n'
     printf 'export AGY_MCP_FORCE_SANDBOX=true\n'
+    # The project manifest is how the control plane learns the project it
+    # serves and where the snapshot lives. Without it the profile refuses to
+    # start, so a bare start outside the controlled pipeline cannot serve.
+    printf 'export AGY_MCP_PROJECT_MANIFEST=/stage/project-manifest.json\n'
+    printf "export AGY_MCP_SNAPSHOT_FINGERPRINT='%s'\n" "$PI_SNAPSHOT_FINGERPRINT"
+    # The Host allowlist the bridge deployment publishes. The bridge forwards
+    # the client's Host header, so the server must admit the published endpoint
+    # and its own listen address, and refuse anything else.
+    printf "export AGY_MCP_HTTP_ALLOWED_HOSTS='%s'\n" "$PI_ALLOWED_HOSTS"
+    # Agent selection is off by default under the profile: an agent name is a
+    # host-side concept a caller cannot be trusted to pick. Opening it is a
+    # deliberate act that also names the whitelist.
+    printf 'export AGY_MCP_DISABLE_AGENT_SELECTION=true\n'
     printf "export AGY_MCP_SESSION_POLICY='%s'\n" "$PI_SESSION_POLICY"
     if [ "$PI_SESSION_POLICY" = managed-only ]; then
         printf "export AGY_MCP_SESSION_TTL='%s'\n" "$PI_SESSION_TTL"
@@ -406,7 +506,13 @@ exec "$PI_BWRAP" \
     --tmpfs /tmp \
     --tmpfs /home \
     --tmpfs /run \
-    --ro-bind "$PI_SNAPSHOT_DIR" /workspace \
+    # The snapshot is bound at the neutral path the project manifest names as
+    # its snapshot root, NOT at /workspace: the control plane runs in the host
+    # view, where no /workspace mount exists, and the mapping from the worker
+    # view (/workspace) onto this path is what the server implements from the
+    # manifest. Binding it at /workspace here would give the control plane the
+    # very mount the mapping is meant to abstract away.
+    --ro-bind "$PI_SNAPSHOT_DIR" "$PI_SNAPSHOT_MOUNT" \
     --bind "$PI_STATE_DIR" /state \
     --ro-bind "$stage" /stage \
     --ro-bind-try "$PI_CONTROL_DIR/gemini" /seed \

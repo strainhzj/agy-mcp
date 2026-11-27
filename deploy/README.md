@@ -44,18 +44,40 @@ instance with its own identity, state dir, token and endpoint, never a wider
   wrapper bakes only whitelisted values into agy's environment.
 - **Deployment identity and snapshot binding.** The launcher writes an
   `instance.json` record (contract version, project, instance, snapshot
-  fingerprint) into the state dir, and fingerprints the snapshot tree (paths,
-  sizes, mtimes; one pass at launch). The server refuses to start without a
-  matching record, so a bare start of the profile fails closed, two instances
-  cannot share one state dir, and every job's ownership record carries the
-  fingerprint: after a snapshot redeploy, old jobs and idempotency keys are
-  refused instead of replayed.
+  fingerprint) into the state dir, and fingerprints the snapshot tree's
+  CONTENT at launch: each file's bytes, not only its path, size and mtime. A
+  content digest matters because a redeploy can rewrite a file in place while
+  keeping its size and timestamps, which a metadata-only fingerprint would not
+  notice; binding that to a job is what makes a redeploy a new deployment
+  rather than a silent continuation of stale answers. The server refuses to
+  start without a matching record, so a bare start of the profile fails closed,
+  two instances cannot share one state dir, and every job's ownership record
+  carries the fingerprint: after a snapshot redeploy, old jobs and idempotency
+  keys are refused instead of replayed.
+- **Project manifest.** The launcher also writes a `project-manifest.json`
+  (contract version, project id, snapshot root, snapshot fingerprint, worker
+  mount, read-only) into the CONTROL dir and stages it read-only into the
+  namespace. It is deployment configuration rather than job state, so it is
+  deliberately kept out of the state dir (the job-store budget and GC must not
+  account for it, and a manifest inside the state dir is refused at startup).
+  It is what tells the control plane which project it serves and where the
+  snapshot lives, and the server refuses to start without it.
+- **Worker-view mount.** The outer namespace binds the snapshot at the neutral
+  path `/snapshot`, and the worker's inner namespace binds that at `/workspace`.
+  The control plane never sees `/workspace`: it runs in the host view, where no
+  such mount exists, and the mapping from the worker view onto the host path is
+  what the server implements from the manifest. So a caller-visible
+  `/workspace/...` path never names a host directory, and the worker cannot
+  learn the host path the snapshot came from.
 - **Fail closed.** Missing bwrap, missing or non-executable pinned binaries,
   a missing snapshot, an unfingerprintable snapshot, a state dir holding a
-  record for another deployment, a non-loopback listen address, a project id
-  or proxy URL with characters the generated scripts cannot carry, or a
-  failed nested-namespace smoke test aborts the launch. The server only opens
-  its port after the worker path has answered a cold-start `--version`.
+  record for another deployment, a control dir holding a manifest for another
+  project or snapshot, a non-loopback listen address, a missing Host allowlist
+  (`PI_ALLOWED_HOSTS`; the server refuses to start under the profile without
+  one), a project id or proxy URL with characters the generated scripts cannot
+  carry, or a failed nested-namespace smoke test aborts the launch. The server
+  only opens its port after the worker path has answered a cold-start
+  `--version`.
 - **Pinned binaries.** agy and agy-mcp are copied into the control-plane
   stage at launch time, so a host-side upgrade cannot swap binaries under a
   running instance. An agy upgrade is a re-verification event, not a restart.

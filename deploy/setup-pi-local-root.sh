@@ -29,6 +29,11 @@ ALLOW_TCP=${PI_SETUP_ALLOW_TCP:-$PROXY_PORT}
 MEM_MAX=${PI_SETUP_MEM_MAX:-1G}
 CPU_MAX=${PI_SETUP_CPU_MAX:-200000 100000}
 PIDS_MAX=${PI_SETUP_PIDS_MAX:-128}
+# The nft table is recreated on every run, so each instance of a multi-project
+# deployment needs its own table name or a second run would delete the first
+# instance's egress whitelist. Default keeps the historical single-instance
+# name; a second instance passes its own (for example PI_SETUP_TABLE=agy_pi_p2).
+TABLE=${PI_SETUP_TABLE:-agy_pi_review}
 
 die() {
     printf 'setup-pi-local-root: %s\n' "$1" >&2
@@ -69,14 +74,14 @@ chmod 700 "$CG"
 # any other destination (other loopback services, direct model endpoints,
 # unrelated ports) is dropped by the kernel. Inbound traffic and other
 # users' traffic are untouched.
-nft list table inet agy_pi_review >/dev/null 2>&1 && nft delete table inet agy_pi_review
+nft list table inet "$TABLE" >/dev/null 2>&1 && nft delete table inet "$TABLE"
 CG_NAME=$(basename "$CG")
 case "$ALLOW_TCP" in
     *,*) PORT_MATCH="{ $ALLOW_TCP }" ;;
     *)   PORT_MATCH="$ALLOW_TCP" ;;
 esac
 nft -f - <<EOF
-table inet agy_pi_review {
+table inet $TABLE {
 	chain egress {
 		type filter hook output priority filter; policy accept;
 		socket cgroupv2 level 1 "$CG_NAME" tcp dport != $PORT_MATCH counter drop
@@ -85,7 +90,7 @@ table inet agy_pi_review {
 EOF
 
 printf 'ok: cgroup %s (memory=%s cpu=%s pids=%s) owned by %s\n' "$CG" "$MEM_MAX" "$CPU_MAX" "$PIDS_MAX" "$RUN_USER"
-printf 'ok: nft egress whitelist active for cgroup "%s": outbound tcp limited to port(s) %s\n' "$CG_NAME" "$ALLOW_TCP"
+printf 'ok: nft egress whitelist active for table "%s" (cgroup "%s"): outbound tcp limited to port(s) %s\n' "$TABLE" "$CG_NAME" "$ALLOW_TCP"
 printf 'verify (as %s, after the instance starts): a probe from inside the\n' "$RUN_USER"
 printf 'instance to an unrelated port must hang/deny while the proxy path works;\n'
 printf 'a probe that SUCCEEDS means the boundary is absent and the endpoint must\n'

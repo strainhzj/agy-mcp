@@ -44,6 +44,20 @@ func HTTPHandler(mgr *manager.Manager, token string) http.Handler {
 		if g := mgr.HTTPGuard(); g.Limited() {
 			opts = &mcp.StreamableHTTPOptions{SessionTimeout: g.SessionTimeout}
 		}
+		// A protected instance is published to its sandboxed clients through a
+		// dedicated bridge, so the Host header names the published address
+		// while the server itself binds loopback: the SDK's localhost Host
+		// check would reject exactly the deployment shape this profile exists
+		// for. The check defends browsers against DNS rebinding, and the
+		// cross-origin protection below plus the profile's mandatory bearer
+		// token are the two checks that actually cover that attack here, so
+		// only a protected deployment disables it.
+		if mgr.Policy().Protected() {
+			if opts == nil {
+				opts = &mcp.StreamableHTTPOptions{}
+			}
+			opts.DisableLocalhostProtection = true
+		}
 	}
 	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return NewServer(mgr)

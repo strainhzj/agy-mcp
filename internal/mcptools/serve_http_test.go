@@ -1,6 +1,7 @@
 package mcptools
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/tphakala/agy-mcp/v2/internal/config"
 	"github.com/tphakala/agy-mcp/v2/internal/manager"
+	"github.com/tphakala/agy-mcp/v2/internal/policy"
 )
 
 func testManager(t *testing.T) *manager.Manager {
@@ -221,5 +223,57 @@ func TestHTTPServeAdvertisesInstructions(t *testing.T) {
 		if !strings.Contains(desc[name], "peer review") {
 			t.Errorf("tool %q description no longer names a use case: %q", name, desc[name])
 		}
+	}
+}
+
+// protectedTestManager builds a manager carrying the protected pi profile,
+// which is what makes HTTPHandler accept a published Host header.
+func protectedTestManager(t *testing.T) *manager.Manager {
+	t.Helper()
+	return manager.New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, DefaultTimeout: time.Minute,
+		ConversationCacheFile: filepath.Join(t.TempDir(), "last_conversations.json"),
+		Policy:                policy.Policy{Profile: policy.ProfilePi}})
+}
+
+// TestHTTPProtectedAllowsPublishedHostHeader pins the bridge shape: a protected
+// instance binds loopback but is published to its sandboxed clients through a
+// dedicated bridge, so the Host header names the published address while the
+// connection arrives on loopback. The SDK's localhost Host check would reject
+// exactly that deployment, so a protected server disables it (the cross-origin
+// protection and the profile's mandatory bearer token still cover the browser
+// attack that check defends against). Removing the DisableLocalhostProtection
+// branch turns the protected half red; the upstream half stays green only
+// while the check remains on for unprotected servers.
+func TestHTTPProtectedAllowsPublishedHostHeader(t *testing.T) {
+	const publishedHost = "192.168.5.45:8865"
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`
+
+	send := func(h http.Handler) (int, string) {
+		ts := httptest.NewServer(h)
+		defer ts.Close()
+		req := postJSON(t, ts.URL+"/mcp", body)
+		req.Host = publishedHost // the bridge's client-visible host, not loopback
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return resp.StatusCode, string(b)
+	}
+
+	// Protected: the published Host header must reach the JSON-RPC layer.
+	code, got := send(HTTPHandler(protectedTestManager(t), ""))
+	if strings.Contains(got, "invalid Host header") {
+		t.Fatalf("protected server rejected the published host: %d %s", code, got)
+	}
+
+	// Upstream: the SDK's localhost protection stays on, byte for byte.
+	code, got = send(HTTPHandler(testManager(t), ""))
+	if !strings.Contains(got, "invalid Host header") {
+		t.Fatalf("upstream server accepted a foreign Host header: %d %s", code, got)
 	}
 }

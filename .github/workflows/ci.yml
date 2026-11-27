@@ -63,17 +63,28 @@ jobs:
           exit ${PIPESTATUS[0]}
       # Actions job logs are auth-gated even on public repos, so a failure leg
       # cannot be read without signing in. Surface the failing tests as check
-      # annotations, which the API returns without authentication.
+      # annotations, which the API returns without authentication. Each failing
+      # test carries its first detail lines so the assertion that failed is
+      # visible without log access.
       - name: Surface go test failures as annotations
         if: always() && matrix.os != 'ubuntu-latest'
         shell: pwsh
         run: |
           if (Test-Path go-test-output.txt) {
-            Select-String -Path go-test-output.txt -Pattern '^--- FAIL' | Select-Object -First 20 | ForEach-Object {
-              Write-Output "::error title=go test failure::$($_.Line)"
-            }
-            Select-String -Path go-test-output.txt -Pattern 'panic:|missing argument|unexpected ' | Select-Object -First 10 | ForEach-Object {
-              Write-Output "::error::$($_.Line)"
+            $lines = Get-Content go-test-output.txt
+            $total = 0
+            for ($i = 0; $i -lt $lines.Count -and $total -lt 80; $i++) {
+              if ($lines[$i] -match '^--- FAIL') {
+                Write-Output "::error title=go test failure::$($lines[$i])"
+                $total++
+                for ($j = $i + 1; $j -lt $lines.Count -and $j -le $i + 8 -and $total -lt 80; $j++) {
+                  if ($lines[$j] -match '^(=== RUN|--- FAIL|--- PASS|--- SKIP|PASS|FAIL|ok  )') { break }
+                  if ($lines[$j].Trim()) {
+                    Write-Output "::error::$($lines[$j])"
+                    $total++
+                  }
+                }
+              }
             }
           }
   lint:

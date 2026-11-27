@@ -4,6 +4,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -45,8 +46,12 @@ func writeRecordFingerprint(t *testing.T, stateDir, project, instance, fingerpri
 
 // writeManifest writes the project manifest the controlled launcher writes
 // for a pi instance: the snapshot root, the fixed worker mount, a content
-// fingerprint and read_only. It returns the manifest path. The file mode is
-// 0440 because LoadProjectManifest refuses a group- or world-writable one.
+// fingerprint and read_only. It returns the manifest path. On POSIX the file
+// mode is 0440 because LoadProjectManifest refuses a group- or world-writable
+// one. Windows cannot express those bits (Go derives FileMode from the
+// read-only attribute alone), and a read-only file would also break TempDir
+// cleanup, so Windows writes the ordinary 0666 and relies on the loader
+// skipping the POSIX-only check.
 func writeManifest(t *testing.T, snapshot, project, fingerprint string) string {
 	t.Helper()
 	path := filepath.Join(dir(t), "project-manifest.json")
@@ -54,7 +59,11 @@ func writeManifest(t *testing.T, snapshot, project, fingerprint string) string {
 		`","snapshot_root":"` + snapshot +
 		`","snapshot_fingerprint":"` + fingerprint +
 		`","worker_mount":"/workspace","read_only":true}`
-	if err := os.WriteFile(path, []byte(body), 0o440); err != nil {
+	perm := os.FileMode(0o440)
+	if runtime.GOOS == "windows" {
+		perm = 0o666
+	}
+	if err := os.WriteFile(path, []byte(body), perm); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
 	return path

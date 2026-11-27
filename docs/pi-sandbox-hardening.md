@@ -170,7 +170,7 @@ type ModePolicy struct {
    - 非空 `raw`: **要求 `filepath.IsAbs(raw)`**, 拒绝相对路径 `cwd` (防止依赖服务端进程自身 `os.Getwd()` 解析或探测宿主机目录)。
    - **POSIX 符号链接顺序防绕过**: 先对原始 `raw` 调用 `filepath.EvalSymlinks(raw)` (不先做 `filepath.Abs`/`filepath.Clean`, 避免 `<allowed>/symlink-to-etc/..` 被提前词法折叠回 `<allowed>` 而绕过拒绝), 再对解析结果做 `filepath.Abs` 与 `os.Stat` 确认 `info.IsDir()`, 任一步失败直接拒绝(不做 best-effort 回落)。
    - 使用 `filepath.Rel(root, resolved)` 判断归属: 仅当 `rel == "."` 或 (`rel != ".."` 且不以 `".."+string(filepath.Separator)` 开头, 且 `!filepath.IsAbs(rel)`) 时放行, 防止 `/srv/workspaces/pi-evil` 前缀绕过; 非 `pi` profile `root` 为 `AllowedRoots` 项, `pi` profile `root` 为映射后的 `SnapshotRoot`。
-   - **`pi` profile 路径映射与边界**: 先要求 `raw` 精确等于 `/workspace` 或以 `/workspace/` 开头 (须精确匹配路径段, 拒绝 `/workspace-evil` 之类相邻前缀), 再映射为 `<SnapshotRoot>/...` 按上一条顺序执行 `EvalSymlinks` -> `Abs` -> `Stat` -> 归属校验 (映射拼接必须复用不提前 `Clean` 的 `joinAsWritten` 或原始字符串拼接, 不得用 `filepath.Join`, 防止 `/workspace/symlink-to-etc/..` 在 `EvalSymlinks` 前被词法折叠绕过); 校验通过后以 `filepath.Join("/workspace", rel)` 拼回, 写回 `req.Cwd` 的仍是 `/workspace/...`。
+   - **`pi` profile 路径映射与边界**: 先要求 `raw` 精确等于 `/workspace` 或以 `/workspace/` 开头 (须精确匹配路径段, 拒绝 `/workspace-evil` 之类相邻前缀), 再映射为 `<SnapshotRoot>/...` 按上一条顺序执行 `EvalSymlinks` -> `Abs` -> `Stat` -> 归属校验 (映射拼接必须复用不提前 `Clean` 的 `joinAsWritten` 或原始字符串拼接, 不得用 `filepath.Join`, 防止 `/workspace/symlink-to-etc/..` 在 `EvalSymlinks` 前被词法折叠绕过); 校验通过后以 `WorkerMount + "/" + filepath.ToSlash(rel)` 拼回 (不 `Clean`, 仅把宿主分隔符改写为 `/`; worker view 是固定 POSIX 挂载, 写回形状跨平台恒定), 写回 `req.Cwd` 的仍是 `/workspace/...`。
 3. **`CheckExtraDirs(cwd string, dirs []string)`**:
    - 若 `AllowedRoots` 为空: 原样返回 `dirs`。
    - 逐项校验: 拒绝空字符串与 root-relative 路径 (`rootRelative`)。

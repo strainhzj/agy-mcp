@@ -558,8 +558,10 @@ func (p Policy) containedInSnapshot(abs string) bool {
 
 // workerViewPath maps a host path back into the worker view. It is the
 // inverse of mapWorkerPath, applied to an already-resolved (symlink-free,
-// ".."-free) host path, so filepath.Join is safe here: the input cannot
-// smuggle a traversal past it.
+// ".."-free) host path, so joining without cleaning is safe here: the input
+// cannot smuggle a traversal past it. The worker view is a fixed POSIX mount,
+// so the persisted spelling is always forward-slash, whatever the host OS
+// uses internally; on POSIX ToSlash is the identity.
 func (p Policy) workerViewPath(host string) (string, error) {
 	rel, err := filepath.Rel(p.SnapshotRoot, host)
 	if err != nil {
@@ -568,7 +570,7 @@ func (p Policy) workerViewPath(host string) (string, error) {
 	if rel == "." {
 		return p.WorkerMount, nil
 	}
-	return filepath.Join(p.WorkerMount, rel), nil
+	return p.WorkerMount + "/" + filepath.ToSlash(rel), nil
 }
 
 // contained reports whether abs is one of the allowed roots or lies under

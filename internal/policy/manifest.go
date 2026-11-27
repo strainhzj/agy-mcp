@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 )
 
 // ManifestSchemaVersion is the only project-manifest contract version this
@@ -101,8 +102,12 @@ func LoadProjectManifest(path string) (ProjectManifest, error) {
 	}
 	// The manifest is deployment-owned configuration. A group- or world-writable
 	// one could be rewritten by anything the worker can reach, so refuse it
-	// rather than trusting a file another process may edit.
-	if info.Mode().Perm()&0o022 != 0 {
+	// rather than trusting a file another process may edit. The rule is
+	// POSIX-only: on Windows Go derives FileMode from the read-only attribute
+	// alone, so group bits never exist there and the check cannot say anything
+	// meaningful (the profile's real deployment is POSIX-only; Windows exists
+	// so the package compiles and its logic tests run).
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o022 != 0 {
 		return ProjectManifest{}, fmt.Errorf("project manifest %s is group- or world-writable (%s); the deployment must write it 0440 or tighter", path, info.Mode().Perm())
 	}
 	data, err := os.ReadFile(path)

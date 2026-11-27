@@ -30,13 +30,16 @@ func policyRoot(t *testing.T) (root, outside string) {
 
 // wpath spells a host path under root in the worker view the pi profile
 // exposes, which is what a caller passes and what the policy writes back.
+// The worker view is a fixed POSIX mount: caller-visible paths always use
+// "/" separators regardless of the host OS, so a Windows CI host sees the
+// same shape a real deployment produces.
 func wpath(t *testing.T, root, host string) string {
 	t.Helper()
 	rel, err := filepath.Rel(root, host)
 	if err != nil {
 		t.Fatalf("rel %s under %s: %v", host, root, err)
 	}
-	return filepath.Join(policy.WorkerMountPath, rel)
+	return policy.WorkerMountPath + "/" + filepath.ToSlash(rel)
 }
 
 func canonicalDir(t *testing.T, p string) string {
